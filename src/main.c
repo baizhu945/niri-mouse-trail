@@ -58,7 +58,6 @@ static struct libevdev *evdev = NULL;
 static int input_fd = -1;
 static pthread_t input_thread;
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
-static double accum_dx = 0, accum_dy = 0;
 
 static int ctrl_fd = -1;
 static int timer_fd = -1;
@@ -256,10 +255,31 @@ static void *input_thread_fn(void *arg) {
     while (running) {
         int rc = libevdev_next_event(evdev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
         if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
-            if (ev.type == EV_REL) {
+            if (ev.type == EV_REL && (ev.code == REL_X || ev.code == REL_Y)) {
                 pthread_mutex_lock(&input_mutex);
-                if (ev.code == REL_X) accum_dx += ev.value;
-                if (ev.code == REL_Y) accum_dy += ev.value;
+                double dx = (ev.code == REL_X) ? (double)ev.value : 0.0;
+                double dy = (ev.code == REL_Y) ? (double)ev.value : 0.0;
+                if (fabs(dx) + fabs(dy) >= trail.min_speed) {
+                    /* Per-event clamping matches compositor behavior */
+                    double new_x = trail.pos_x + dx;
+                    double new_y = trail.pos_y + dy;
+                    if (new_x < bounds_min_x) { dx = bounds_min_x - trail.pos_x; trail.pos_x = bounds_min_x; }
+                    else if (new_x > bounds_max_x) { dx = bounds_max_x - trail.pos_x; trail.pos_x = bounds_max_x; }
+                    else trail.pos_x = new_x;
+                    if (new_y < bounds_min_y) { dy = bounds_min_y - trail.pos_y; trail.pos_y = bounds_min_y; }
+                    else if (new_y > bounds_max_y) { dy = bounds_max_y - trail.pos_y; trail.pos_y = bounds_max_y; }
+                    else trail.pos_y = new_y;
+                    if (dx != 0.0 || dy != 0.0) {
+                        int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
+                        trail.points[idx].x = trail.pos_x;
+                        trail.points[idx].y = trail.pos_y;
+                        trail.points[idx].timestamp_ms = get_time_ms();
+                        if (trail.count < MAX_TRAIL_POINTS) trail.count++;
+                        else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
+                        trail.stationary_start = 0;
+                        need_redraw = 1;
+                    }
+                }
                 pthread_mutex_unlock(&input_mutex);
             }
         } else if (rc == -EAGAIN) { usleep(200); }
@@ -438,39 +458,17 @@ int main(int argc, char *argv[]) {
                 uint64_t now = get_time_ms();
 
                 pthread_mutex_lock(&input_mutex);
-                double dx = accum_dx, dy = accum_dy;
-                accum_dx = 0; accum_dy = 0;
-                pthread_mutex_unlock(&input_mutex);
-
-                if (dx != 0.0 || dy != 0.0) {
-                    /* Check min_speed on RAW physical pixels BEFORE scaling */
-                    double raw_dist = sqrt(dx*dx + dy*dy);
-                    if (raw_dist >= trail.min_speed) {
-                        trail.stationary_start = 0;
-                        /* Clamp to bounds before feeding */
-                        double new_x = trail.pos_x + dx;
-                        double new_y = trail.pos_y + dy;
-                        if (new_x < bounds_min_x) new_x = bounds_min_x;
-                        if (new_x > bounds_max_x) new_x = bounds_max_x;
-                        if (new_y < bounds_min_y) new_y = bounds_min_y;
-                        if (new_y > bounds_max_y) new_y = bounds_max_y;
-                        double cdx = new_x - trail.pos_x;
-                        double cdy = new_y - trail.pos_y;
-                        if (cdx != 0.0 || cdy != 0.0)
-                            trail_feed(&trail, cdx, cdy, now);
-                    } else if (trail.stationary_start == 0) {
-                        trail.stationary_start = now;
-                    }
-                }
-
                 if (color_cycle_on) {
                     double t = fmod((double)(now-start_time_ms)/1000.0/cycle_speed, 1.0);
                     double rr,gg,bb; hsl_to_rgb(t,1.0,0.5,&rr,&gg,&bb);
                     trail_set_color_rgb(&trail, rr, gg, bb);
                 }
-
                 int alive = trail_cleanup(&trail, now);
-                if (alive > 0 || need_redraw) { render_all(); need_redraw = 0; }
+                int redraw = need_redraw;
+                need_redraw = 0;
+                pthread_mutex_unlock(&input_mutex);
+
+                if (alive > 0 || redraw) render_all();
             } else if (ctrl_fd>=0 && events[i].data.fd == ctrl_fd) {
                 int client = accept(ctrl_fd, NULL, NULL);
                 if (client >= 0) { char buf[256]; ssize_t nr = read(client,buf,sizeof(buf)-1);
