@@ -432,8 +432,6 @@ int main(int argc, char *argv[]) {
                     double raw_dist = sqrt(dx*dx + dy*dy);
                     if (raw_dist >= trail.min_speed) {
                         trail.stationary_start = 0;
-                        double scale = get_active_scale(trail.pos_x, trail.pos_y);
-                        if (scale > 0) { dx /= scale; dy /= scale; }
                         trail_feed(&trail, dx, dy, now);
                     } else if (trail.stationary_start == 0) {
                         trail.stationary_start = now;
