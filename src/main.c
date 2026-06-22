@@ -351,9 +351,7 @@ int main(int argc, char *argv[]) {
       for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
         if(o->global_x<mix)mix=o->global_x; if(o->global_x+o->phys_w>maxx)maxx=o->global_x+o->phys_w;
         if(o->global_y<miy)miy=o->global_y; if(o->global_y+o->phys_h>may)may=o->global_y+o->phys_h; }
-      est_x=(mix+maxx)/2.0; est_y=(miy+may)/2.0;
-      bounds_min_x=mix; bounds_max_x=maxx; bounds_min_y=miy; bounds_max_y=may;
-      LOG_INFO("Bounds: x=[%d,%d] y=[%d,%d]", mix, maxx, miy, may); }
+      est_x=(mix+maxx)/2.0; est_y=(miy+may)/2.0; }
 
     for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
         o->surface=wl_compositor_create_surface(compositor);
@@ -364,6 +362,18 @@ int main(int argc, char *argv[]) {
         zwlr_layer_surface_v1_set_keyboard_interactivity(o->layer_surface,0);
         wl_surface_commit(o->surface); }
     wl_display_roundtrip(display); wl_display_roundtrip(display);
+
+    /* Compute cursor bounds from LOGICAL surface dimensions */
+    { bounds_min_x = bounds_max_x = bounds_min_y = bounds_max_y = 0;
+      for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
+        double l = o->global_x, r = o->global_x + (double)o->width;
+        double t = o->global_y, b = o->global_y + (double)o->height;
+        if(i==0 || l<bounds_min_x) bounds_min_x=l;
+        if(i==0 || r>bounds_max_x) bounds_max_x=r;
+        if(i==0 || t<bounds_min_y) bounds_min_y=t;
+        if(i==0 || b>bounds_max_y) bounds_max_y=b; }
+      LOG_INFO("Bounds: x=[%.0f,%.0f] y=[%.0f,%.0f]",
+               bounds_min_x, bounds_max_x, bounds_min_y, bounds_max_y); }
 
     /* Map surfaces with transparent frames */
     for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
