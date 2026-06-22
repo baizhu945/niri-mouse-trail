@@ -17,7 +17,9 @@
 #include <sys/un.h>
 #include <sys/timerfd.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <errno.h>
+#include <signal.h>
 #include <pthread.h>
 #include <linux/input.h>
 
@@ -375,7 +377,14 @@ static void usage(const char *p) {
         "  --ctl \"CMD\"         Send command\n  --help\n", p);
     }
 
+static void signal_handler(int sig) {
+    (void)sig;
+    running = 0;
+}
+
 int main(int argc, char *argv[]) {
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
     const char *device_path = "/dev/input/event2";
     double cr=1.0,cg=1.0,cb=1.0,ca=1.0, width=8.0;
     uint64_t length_ms=500; double min_speed=2.0, smooth_factor=0.6;
@@ -501,10 +510,22 @@ int main(int argc, char *argv[]) {
 
     if (cursor_captured) { est_x=captured_cursor_x; est_y=captured_cursor_y; }
     else {
-        /* Fallback: center of first (primary) output in logical coords */
-        est_x = outputs[0].global_x + outputs[0].width / 2.0;
-        est_y = outputs[0].global_y + outputs[0].height / 2.0;
-        LOG_INFO("Cursor not captured, using output 0 center");
+        /* Fallback: last saved position, or primary output center */
+        const char *home = getenv("HOME");
+        char posfile[512];
+        if (home) snprintf(posfile, sizeof(posfile), "%s/.cache/mouse-trail/position", home);
+        else snprintf(posfile, sizeof(posfile), "/tmp/mouse-trail-position");
+        FILE *pf = fopen(posfile, "r");
+        if (pf) {
+            if (fscanf(pf, "%lf %lf", &est_x, &est_y) == 2) {
+                LOG_INFO("Loaded saved position: (%.0f, %.0f)", est_x, est_y);
+            }
+            fclose(pf);
+        } else {
+            est_x = outputs[0].global_x + outputs[0].width / 2.0;
+            est_y = outputs[0].global_y + outputs[0].height / 2.0;
+            LOG_INFO("No saved position, using output 0 center");
+        }
     }
     trail_set_position(&trail, est_x, est_y);
 
@@ -572,6 +593,18 @@ int main(int argc, char *argv[]) {
     }
 
     LOG_INFO("Shutting down");
+
+    /* Save cursor position for next session */
+    {   const char *home = getenv("HOME");
+        char posfile[512];
+        if (home) {
+            snprintf(posfile, sizeof(posfile), "%s/.cache/mouse-trail", home);
+            mkdir(posfile, 0755);
+            snprintf(posfile, sizeof(posfile), "%s/.cache/mouse-trail/position", home);
+            FILE *pf = fopen(posfile, "w");
+            if (pf) { fprintf(pf, "%.0f %.0f\n", trail.pos_x, trail.pos_y); fclose(pf); }
+        }
+    }
     pthread_cancel(input_thread); pthread_join(input_thread, NULL);
     for(int i=0;i<num_outputs;i++){ if(outputs[i].layer_surface)zwlr_layer_surface_v1_destroy(outputs[i].layer_surface); if(outputs[i].surface)wl_surface_destroy(outputs[i].surface); if(outputs[i].wl_output)wl_output_destroy(outputs[i].wl_output); }
     if(pointer)wl_pointer_destroy(pointer); if(seat)wl_seat_destroy(seat);
