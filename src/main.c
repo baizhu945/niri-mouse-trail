@@ -17,7 +17,6 @@
 #include <sys/un.h>
 #include <sys/timerfd.h>
 #include <sys/epoll.h>
-#include <sys/stat.h>
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
@@ -510,36 +509,15 @@ int main(int argc, char *argv[]) {
 
     if (cursor_captured) { est_x=captured_cursor_x; est_y=captured_cursor_y; }
     else {
-        /* Fallback: last saved position, or primary output center */
-        const char *home = getenv("HOME");
-        char posfile[512];
-        if (home) snprintf(posfile, sizeof(posfile), "%s/.cache/mouse-trail/position", home);
-        else snprintf(posfile, sizeof(posfile), "/tmp/mouse-trail-position");
-        FILE *pf = fopen(posfile, "r");
-        if (pf) {
-            if (fscanf(pf, "%lf %lf", &est_x, &est_y) == 2) {
-                LOG_INFO("Loaded saved position: (%.0f, %.0f)", est_x, est_y);
-            }
-            fclose(pf);
-        } else {
-            est_x = outputs[0].global_x + outputs[0].width / 2.0;
-            est_y = outputs[0].global_y + outputs[0].height / 2.0;
-            LOG_INFO("No saved position, using output 0 center");
-        }
+        est_x = outputs[0].global_x + outputs[0].width / 2.0;
+        est_y = outputs[0].global_y + outputs[0].height / 2.0;
+        LOG_INFO("Cursor not captured, using output 0 center");
     }
     trail_set_position(&trail, est_x, est_y);
 
-    /* Set tiny input region at each output center for warp detection */
-    for(int i=0;i<num_outputs;i++){
-        struct wl_region *r = wl_compositor_create_region(compositor);
-        /* 4x4 pixel region at the output center (surface coords) */
-        int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-        wl_region_add(r, cx - 2, cy - 2, 4, 4);
-        wl_surface_set_input_region(outputs[i].surface, r);
-        wl_region_destroy(r);
-        wl_surface_commit(outputs[i].surface);
-    }
-    wl_display_roundtrip(display);
+    /* Keep full input region during init for cursor capture, then switch.
+       The tiny_region_set flag controls when we switch to center-only. */
+    int tiny_region_set = 0;
     LOG_INFO("Position: (%.0f,%.0f), %d outputs%s", est_x, est_y, num_outputs,
              cursor_captured ? " (captured)" : " (primary output center)");
     LOG_INFO("Input regions: 4x4px at output centers (warp detection)");
@@ -559,6 +537,20 @@ int main(int argc, char *argv[]) {
     LOG_INFO("Main loop");
 
     while (running) {
+        /* Transition from full input to center-only after cursor captured or 5s */
+        if (!tiny_region_set && (cursor_captured || get_time_ms() - start_time_ms > 5000)) {
+            for(int i=0;i<num_outputs;i++){
+                struct wl_region *r = wl_compositor_create_region(compositor);
+                int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
+                wl_region_add(r, cx - 20, cy - 20, 40, 40);
+                wl_surface_set_input_region(outputs[i].surface, r);
+                wl_region_destroy(r);
+                wl_surface_commit(outputs[i].surface);
+            }
+            tiny_region_set = 1;
+            LOG_INFO("Switched to center input region (warp detection)");
+        }
+
         while (wl_display_prepare_read(display)!=0) wl_display_dispatch_pending(display);
         wl_display_flush(display);
         struct epoll_event events[8];
@@ -593,18 +585,6 @@ int main(int argc, char *argv[]) {
     }
 
     LOG_INFO("Shutting down");
-
-    /* Save cursor position for next session */
-    {   const char *home = getenv("HOME");
-        char posfile[512];
-        if (home) {
-            snprintf(posfile, sizeof(posfile), "%s/.cache/mouse-trail", home);
-            mkdir(posfile, 0755);
-            snprintf(posfile, sizeof(posfile), "%s/.cache/mouse-trail/position", home);
-            FILE *pf = fopen(posfile, "w");
-            if (pf) { fprintf(pf, "%.0f %.0f\n", trail.pos_x, trail.pos_y); fclose(pf); }
-        }
-    }
     pthread_cancel(input_thread); pthread_join(input_thread, NULL);
     for(int i=0;i<num_outputs;i++){ if(outputs[i].layer_surface)zwlr_layer_surface_v1_destroy(outputs[i].layer_surface); if(outputs[i].surface)wl_surface_destroy(outputs[i].surface); if(outputs[i].wl_output)wl_output_destroy(outputs[i].wl_output); }
     if(pointer)wl_pointer_destroy(pointer); if(seat)wl_seat_destroy(seat);
