@@ -537,6 +537,10 @@ int main(int argc, char *argv[]) {
     struct epoll_event evt; evt.events=EPOLLIN;
     evt.data.fd=timer_fd; epoll_ctl(epfd,EPOLL_CTL_ADD,timer_fd,&evt);
     if(ctrl_fd>=0){ evt.data.fd=ctrl_fd; epoll_ctl(epfd,EPOLL_CTL_ADD,ctrl_fd,&evt); }
+    /* Add display fd for immediate Wayland event dispatch */
+    int display_fd = wl_display_get_fd(display);
+    evt.data.fd = display_fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, display_fd, &evt);
 
     LOG_INFO("Main loop");
 
