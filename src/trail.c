@@ -26,17 +26,7 @@ void trail_set_position(trail_state_t *t, double x, double y) {
 
 int trail_feed(trail_state_t *t, double rel_x, double rel_y, uint64_t now_ms) {
     if (!t->visible) return 0;
-
-    double dist = sqrt(rel_x * rel_x + rel_y * rel_y);
-    if (dist < t->min_speed) {
-        if (t->stationary_start == 0) {
-            t->stationary_start = now_ms;
-            LOG_DEBUG("trail: stationary detected");
-        }
-        return 0;
-    }
-
-    t->stationary_start = 0;
+    if (rel_x == 0.0 && rel_y == 0.0) return 0;
 
     /* Shift all existing points away from cursor by the movement delta */
     for (int i = 0; i < t->count; i++) {
@@ -61,8 +51,8 @@ int trail_feed(trail_state_t *t, double rel_x, double rel_y, uint64_t now_ms) {
     t->pos_x += rel_x;
     t->pos_y += rel_y;
 
-    LOG_DEBUG("trail: point added pos=(%.1f,%.1f) count=%d dist=%.2f",
-              t->pos_x, t->pos_y, t->count, dist);
+    LOG_DEBUG("trail: point added pos=(%.1f,%.1f) count=%d",
+              t->pos_x, t->pos_y, t->count);
     return 1;
 }
 
@@ -207,13 +197,12 @@ int main(void) {
     assert(t.count == 0);
     printf("PASS: all cleaned\n");
 
-    printf("=== Test 8: stationary detection ===\n");
+    printf("=== Test 8: zero delta returns 0 ===\n");
     trail_init(&t, 8.0, 500, 2.0, 0.6, 1.0, 1.0, 1.0, 1.0);
     trail_set_position(&t, 0.0, 0.0);
     moved = trail_feed(&t, 0.0, 0.0, 2000);
     assert(moved == 0);
-    assert(t.stationary_start == 2000);
-    printf("PASS: stationary at %lu\n", (unsigned long)t.stationary_start);
+    printf("PASS: zero delta skipped\n");
 
     printf("\n=== ALL TRAIL TESTS PASSED (8/8) ===\n");
     return 0;
