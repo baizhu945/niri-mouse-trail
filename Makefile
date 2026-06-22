@@ -5,7 +5,7 @@ LDFLAGS = -lm -lwayland-client -lcairo -levdev
 SRC_DIR = src
 BUILD_DIR = build
 
-SRCS = $(SRC_DIR)/main.c $(SRC_DIR)/trail.c $(SRC_DIR)/wlr-layer-shell-client-protocol.c $(SRC_DIR)/xdg-shell-client-protocol.c $(SRC_DIR)/relative-pointer-client-protocol.c
+SRCS = $(SRC_DIR)/main.c $(SRC_DIR)/trail.c $(SRC_DIR)/wlr-layer-shell-client-protocol.c $(SRC_DIR)/xdg-shell-client-protocol.c
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 TARGET = mouse-trail
 
