@@ -4,6 +4,7 @@
 #include "log.h"
 #include "trail.h"
 #include "wlr-layer-shell-client-protocol.h"
+#include "relative-pointer-client-protocol.h"
 #include <wayland-client.h>
 #include <cairo/cairo.h>
 #include <libevdev/libevdev.h>
@@ -42,6 +43,8 @@ static struct wl_shm *shm = NULL;
 static struct zwlr_layer_shell_v1 *layer_shell = NULL;
 static struct wl_seat *seat = NULL;
 static struct wl_pointer *pointer = NULL;
+static struct zwp_relative_pointer_manager_v1 *rel_ptr_manager = NULL;
+static struct zwp_relative_pointer_v1 *rel_pointer = NULL;
 
 static output_t outputs[MAX_OUTPUTS];
 static int num_outputs = 0;
@@ -55,14 +58,14 @@ static uint64_t start_time_ms = 0;
 
 static struct libevdev *evdev = NULL;
 static int input_fd = -1;
-static pthread_t input_thread;
-static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
-static double pending_rel_x = 0, pending_rel_y = 0;
-
 static int ctrl_fd = -1;
 static int timer_fd = -1;
 static int running = 1;
 static int need_redraw = 0;
+
+/* Relative pointer motion accumulation */
+static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
+static double accum_dx = 0, accum_dy = 0;
 
 static int color_cycle_on = 0;
 static double cycle_speed = 5.0;
@@ -200,6 +203,23 @@ static const struct wl_pointer_listener pointer_listener = {
     .frame = ptr_frame,
 };
 
+/* zwp_relative_pointer_v1 listener — compositor-processed relative motion */
+static void rel_ptr_motion(void *data, struct zwp_relative_pointer_v1 *rp,
+                            uint32_t utime_hi, uint32_t utime_lo,
+                            wl_fixed_t dx, wl_fixed_t dy,
+                            wl_fixed_t dx_unaccel, wl_fixed_t dy_unaccel) {
+    (void)data; (void)rp; (void)utime_hi; (void)utime_lo;
+    (void)dx_unaccel; (void)dy_unaccel;
+    pthread_mutex_lock(&input_mutex);
+    accum_dx += wl_fixed_to_double(dx);
+    accum_dy += wl_fixed_to_double(dy);
+    pthread_mutex_unlock(&input_mutex);
+}
+
+static const struct zwp_relative_pointer_v1_listener rel_pointer_listener = {
+    .relative_motion = rel_ptr_motion,
+};
+
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
                              const char *interface, uint32_t version) {
     (void)data;
@@ -232,6 +252,10 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
             pointer = wl_seat_get_pointer(seat);
             LOG_INFO("Bound wl_seat + wl_pointer");
         }
+    } else if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0) {
+        rel_ptr_manager = wl_registry_bind(reg, name,
+            &zwp_relative_pointer_manager_v1_interface, 1);
+        LOG_INFO("Bound zwp_relative_pointer_manager_v1");
     }
 }
 
@@ -372,23 +396,6 @@ static void setup_control_socket(const char *path) {
 
 static void *input_thread_fn(void *arg) {
     (void)arg;
-    struct input_event ev;
-    while (running) {
-        int rc = libevdev_next_event(evdev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-        if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
-            if (ev.type == EV_REL) {
-                pthread_mutex_lock(&input_mutex);
-                if (ev.code == REL_X) pending_rel_x += ev.value;
-                if (ev.code == REL_Y) pending_rel_y += ev.value;
-                pthread_mutex_unlock(&input_mutex);
-            }
-        } else if (rc == -EAGAIN) {
-            usleep(500);
-        } else if (rc < 0 && rc != -ENODEV) {
-            LOG_ERROR("libevdev error: %d", rc);
-            break;
-        }
-    }
     return NULL;
 }
 
@@ -516,6 +523,12 @@ int main(int argc, char *argv[]) {
     if (pointer) {
         wl_pointer_add_listener(pointer, &pointer_listener, NULL);
     }
+    if (rel_ptr_manager && pointer) {
+        rel_pointer = zwp_relative_pointer_manager_v1_get_relative_pointer(
+            rel_ptr_manager, pointer);
+        zwp_relative_pointer_v1_add_listener(rel_pointer, &rel_pointer_listener, NULL);
+        LOG_INFO("Relative pointer created");
+    }
 
     /* Estimate cursor position from screen geometry */
     double est_x = 0, est_y = 0;
@@ -583,7 +596,7 @@ int main(int argc, char *argv[]) {
 
     setup_control_socket(socket_path);
     start_time_ms = get_time_ms();
-    pthread_create(&input_thread, NULL, input_thread_fn, NULL);
+    /* evdev input thread NOT started — using zwp_relative_pointer for motion */
 
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     struct itimerspec its = {{0,16666667},{0,1}};
@@ -650,8 +663,8 @@ int main(int argc, char *argv[]) {
                 uint64_t now = get_time_ms();
 
                 pthread_mutex_lock(&input_mutex);
-                double dx = pending_rel_x, dy = pending_rel_y;
-                pending_rel_x = 0; pending_rel_y = 0;
+                double dx = accum_dx, dy = accum_dy;
+                accum_dx = 0; accum_dy = 0;
                 pthread_mutex_unlock(&input_mutex);
 
                 if (dx != 0.0 || dy != 0.0)
@@ -686,7 +699,6 @@ int main(int argc, char *argv[]) {
     }
 
     LOG_INFO("Shutting down");
-    pthread_cancel(input_thread); pthread_join(input_thread, NULL);
     for (int i = 0; i < num_outputs; i++) {
         if (outputs[i].layer_surface) zwlr_layer_surface_v1_destroy(outputs[i].layer_surface);
         if (outputs[i].surface) wl_surface_destroy(outputs[i].surface);
@@ -696,6 +708,8 @@ int main(int argc, char *argv[]) {
     if (shm) wl_shm_destroy(shm);
     if (layer_shell) zwlr_layer_shell_v1_destroy(layer_shell);
     if (pointer) wl_pointer_destroy(pointer);
+    if (rel_pointer) zwp_relative_pointer_v1_destroy(rel_pointer);
+    if (rel_ptr_manager) zwp_relative_pointer_manager_v1_destroy(rel_ptr_manager);
     if (seat) wl_seat_destroy(seat);
     if (registry) wl_registry_destroy(registry);
     if (display) wl_display_disconnect(display);

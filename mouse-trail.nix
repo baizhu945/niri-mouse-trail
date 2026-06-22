@@ -25,9 +25,12 @@ let
         -c src/xdg-shell-client-protocol.c -o build/xdg-shell.o
 
       gcc $CFLAGS \
+        -c src/relative-pointer-client-protocol.c -o build/rel-ptr.o
+
+      gcc $CFLAGS \
         -c src/main.c -o build/main.o
 
-      gcc build/trail.o build/wlr-layer-shell.o build/xdg-shell.o build/main.o \
+      gcc build/trail.o build/wlr-layer-shell.o build/xdg-shell.o build/rel-ptr.o build/main.o \
         -o mouse-trail $LIBS
     '';
 
