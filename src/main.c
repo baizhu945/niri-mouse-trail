@@ -31,7 +31,8 @@ typedef struct {
     struct wl_surface *surface;
     struct zwlr_layer_surface_v1 *layer_surface;
     int global_x, global_y;
-    int width, height;
+    int width, height;       /* logical surface dimensions */
+    int phys_w, phys_h;      /* physical pixel dimensions from mode */
     double scale;
     int configured;
 } output_t;
@@ -90,8 +91,8 @@ static void hsl_to_rgb(double h, double s, double l, double *r, double *g, doubl
 static double get_active_scale(double gx, double gy) {
     for (int i = 0; i < num_outputs; i++) {
         output_t *o = &outputs[i];
-        if (gx >= o->global_x && gx < o->global_x + o->width &&
-            gy >= o->global_y && gy < o->global_y + o->height)
+        if (gx >= o->global_x && gx < o->global_x + o->phys_w &&
+            gy >= o->global_y && gy < o->global_y + o->phys_h)
             return o->scale > 0 ? o->scale : 1.0;
     }
     return 1.0;
@@ -109,7 +110,8 @@ static void output_mode(void *data, struct wl_output *wo,
     (void)data;(void)refresh;
     if (!(flags & WL_OUTPUT_MODE_CURRENT)) return;
     for (int i = 0; i < num_outputs; i++)
-        if (outputs[i].wl_output == wo) { outputs[i].width = w; outputs[i].height = h; return; }
+        if (outputs[i].wl_output == wo) {             outputs[i].phys_w = w; outputs[i].phys_h = h;
+            LOG_INFO("Output %d mode: %dx%d", i, w, h); return; }
 }
 static void output_scale(void *data, struct wl_output *wo, int32_t factor) {
     for (int i = 0; i < num_outputs; i++)
@@ -177,7 +179,14 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *s,
     uint32_t serial, uint32_t w, uint32_t h) {
     (void)data; zwlr_layer_surface_v1_ack_configure(s, serial);
     for (int i = 0; i < num_outputs; i++)
-        if (outputs[i].layer_surface == s) { outputs[i].width=(int)w; outputs[i].height=(int)h; outputs[i].configured=1; return; }
+        if (outputs[i].layer_surface == s) {
+            outputs[i].width=(int)w; outputs[i].height=(int)h; outputs[i].configured=1;
+            if (outputs[i].phys_w > 0 && w > 0)
+                outputs[i].scale = (double)outputs[i].phys_w / (double)w;
+            LOG_INFO("Output %d: logical=%dx%d phys=%dx%d scale=%.2f",
+                     i, (int)w, (int)h, outputs[i].phys_w, outputs[i].phys_h, outputs[i].scale);
+            return;
+        }
 }
 static void layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *s) { (void)data; zwlr_layer_surface_v1_destroy(s); running=0; }
 static const struct zwlr_layer_surface_v1_listener layer_surface_listener = { .configure=layer_surface_configure, .closed=layer_surface_closed };
