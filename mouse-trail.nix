@@ -98,4 +98,8 @@ in
     toggle-script
     ctl-script
   ];
+
+  home.file = {
+    ".config/mouse-trail/config".source = ./config.example;
+  };
 }

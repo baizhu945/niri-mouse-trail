@@ -1,0 +1,13 @@
+# Mouse Trail Configuration
+# Lines starting with # are comments
+# Use import=path to include another config file
+
+color=#80c8ff
+alpha=0.5
+width=6
+length=400
+min_speed=2
+smooth_factor=0.6
+color_cycle=off
+cycle_speed=5
+device=/dev/input/event2
