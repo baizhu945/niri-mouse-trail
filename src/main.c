@@ -548,8 +548,8 @@ int main(int argc, char *argv[]) {
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
                 /* Bullseye: 10x10 center + cross arms (60px each way) */
                 wl_region_add(r, cx - 5,  cy - 5,  10, 10);  /* center */
-                wl_region_add(r, cx - 50, cy - 1,  100, 2);  /* horizontal */
-                wl_region_add(r, cx - 1,  cy - 50, 2,  100); /* vertical */
+                wl_region_add(r, cx - 100, cy - 1,  200, 2); /* horizontal */
+                wl_region_add(r, cx - 1,  cy - 100, 2,  200); /* vertical */
                 wl_surface_set_input_region(outputs[i].surface, r);
                 wl_region_destroy(r);
                 wl_surface_commit(outputs[i].surface);

@@ -188,14 +188,14 @@ After the initial 5-second calibration window, the input region shrinks to a **b
 
 ```
                           ↑
-                          │  2×100 vertical arm
+                          │  2×200 vertical arm
                           │
                           │
                    ┌──────┼──────┐
                    │      │      │
                    │      │      │
     ═══════════════╪══════╪══════╪═══════════════
-    100×2 horiz. →│ 10×10│      │← 100×2 horizontal arm
+    200×2 horiz. →│ 10×10│      │← 200×2 horizontal arm
     ═══════════════╪══════╪══════╪═══════════════
                    │      │      │
                    │      │      │
@@ -203,15 +203,15 @@ After the initial 5-second calibration window, the input region shrinks to a **b
                           │
                           │
                           │
-                          ↓  2×100 vertical arm
+                          ↓  2×200 vertical arm
 ```
 
 Only the cross-shaped lines (10×10 center square + horizontal/vertical arms) receive pointer events. The rest of the screen has full click passthrough.
 
 - **10×10 center** (100 px²): catches the cursor when it warps to the output center (niri `focus-monitor-*`)
-- **Horizontal arm** 100×2 (200 px²): catches cursor moving left/right from center
-- **Vertical arm** 2×100 (200 px²): catches cursor moving up/down from center
-- **Total area**: ~500 px² — less than 0.04% of a 1440×900 surface
+- **Horizontal arm** 200×2 (400 px²): catches cursor moving left/right from center
+- **Vertical arm** 2×200 (400 px²): catches cursor moving up/down from center
+- **Total area**: ~900 px² — less than 0.07% of a 1440×900 surface
 
 **Why this design?** When niri warps the cursor to another monitor, the cursor lands at the output center. If the cursor is hidden (niri's `hide-after-inactive-ms`), the compositor may delay sending `wl_pointer.enter` events. The bullseye arms catch the cursor as it moves away from center in any direction, providing a second chance at calibration. The minimal area ensures everyday clicks are virtually never blocked.
 
