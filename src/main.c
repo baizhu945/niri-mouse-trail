@@ -259,7 +259,7 @@ static void *input_thread_fn(void *arg) {
                 pthread_mutex_lock(&input_mutex);
                 double dx = (ev.code == REL_X) ? (double)ev.value : 0.0;
                 double dy = (ev.code == REL_Y) ? (double)ev.value : 0.0;
-                if (fabs(dx) + fabs(dy) >= trail.min_speed) {
+                if (dx != 0.0 || dy != 0.0) {
                     /* Per-event clamping matches compositor behavior */
                     double new_x = trail.pos_x + dx;
                     double new_y = trail.pos_y + dy;
