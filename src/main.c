@@ -51,6 +51,7 @@ static int num_outputs = 0;
 
 static double captured_cursor_x = 0, captured_cursor_y = 0;
 static int cursor_captured = 0;
+static struct wl_surface *current_pointer_surface = NULL;
 
 static trail_state_t trail;
 static uint64_t start_time_ms = 0;
@@ -122,7 +123,7 @@ static const struct wl_output_listener output_listener = {
 static void ptr_enter(void *data, struct wl_pointer *p,
     uint32_t serial, struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {
     (void)data;(void)p;(void)serial;
-    if (cursor_captured) return;
+    current_pointer_surface = surface;
     double psx = wl_fixed_to_double(sx), psy = wl_fixed_to_double(sy);
     for (int i = 0; i < num_outputs; i++) {
         if (outputs[i].surface == surface) {
@@ -133,26 +134,29 @@ static void ptr_enter(void *data, struct wl_pointer *p,
             trail_set_position(&trail, captured_cursor_x, captured_cursor_y);
             need_redraw = 1;
             pthread_mutex_unlock(&input_mutex);
-            LOG_INFO("Cursor recalibrated via enter: output=%d global=(%.0f,%.0f)", i, captured_cursor_x, captured_cursor_y);
+            LOG_INFO("Recalibrated via enter: output=%d global=(%.0f,%.0f)", i, captured_cursor_x, captured_cursor_y);
             return;
         }
     }
 }
-static void ptr_leave(void *d,struct wl_pointer *p,uint32_t s,struct wl_surface *sf){(void)d;(void)p;(void)s;(void)sf;}
+static void ptr_leave(void *d,struct wl_pointer *p,uint32_t s,struct wl_surface *sf){
+    (void)d;(void)p;(void)s;
+    if (current_pointer_surface == sf) current_pointer_surface = NULL;
+}
 static void ptr_motion(void *d,struct wl_pointer *p,uint32_t t,wl_fixed_t sx,wl_fixed_t sy){
     (void)d;(void)p;(void)t;
+    if (!current_pointer_surface) return;
     double psx = wl_fixed_to_double(sx), psy = wl_fixed_to_double(sy);
     for (int i = 0; i < num_outputs; i++) {
-        if (outputs[i].configured && psx >= 0 && psx < outputs[i].width &&
-            psy >= 0 && psy < outputs[i].height) {
-            pthread_mutex_lock(&input_mutex);
+        if (outputs[i].surface == current_pointer_surface) {
             captured_cursor_x = outputs[i].global_x + psx;
             captured_cursor_y = outputs[i].global_y + psy;
             cursor_captured = 1;
+            pthread_mutex_lock(&input_mutex);
             trail_set_position(&trail, captured_cursor_x, captured_cursor_y);
             need_redraw = 1;
             pthread_mutex_unlock(&input_mutex);
-            LOG_DEBUG("Cursor recalibrated via motion: global=(%.0f,%.0f)", captured_cursor_x, captured_cursor_y);
+            LOG_DEBUG("Recalibrated via motion: output=%d global=(%.0f,%.0f)", i, captured_cursor_x, captured_cursor_y);
             return;
         }
     }
