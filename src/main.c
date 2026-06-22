@@ -52,6 +52,8 @@ static int num_outputs = 0;
 static double captured_cursor_x = 0, captured_cursor_y = 0;
 static int cursor_captured = 0;
 static struct wl_surface *current_pointer_surface = NULL;
+static int last_captured_output = -1;
+static int need_full_recapture = 0;
 
 static trail_state_t trail;
 static uint64_t start_time_ms = 0;
@@ -65,6 +67,7 @@ static int ctrl_fd = -1;
 static int timer_fd = -1;
 static int running = 1;
 static int need_redraw = 0;
+static int center_region_set = 0;
 
 static int color_cycle_on = 0;
 static double cycle_speed = 5.0;
@@ -127,6 +130,13 @@ static void ptr_enter(void *data, struct wl_pointer *p,
     double psx = wl_fixed_to_double(sx), psy = wl_fixed_to_double(sy);
     for (int i = 0; i < num_outputs; i++) {
         if (outputs[i].surface == surface) {
+            /* Detect warp: cursor captured on different output */
+            if (center_region_set && last_captured_output >= 0 && i != last_captured_output) {
+                need_full_recapture = 1;
+                LOG_INFO("Warp detected: output %d -> %d, expanding to full recapture",
+                         last_captured_output, i);
+            }
+            last_captured_output = i;
             captured_cursor_x = outputs[i].global_x + psx;
             captured_cursor_y = outputs[i].global_y + psy;
             cursor_captured = 1;
@@ -540,8 +550,6 @@ int main(int argc, char *argv[]) {
     evt.data.fd = display_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, display_fd, &evt);
 
-    int center_region_set = 0;
-
     LOG_INFO("Main loop");
 
     while (running) {
@@ -550,13 +558,29 @@ int main(int argc, char *argv[]) {
             for(int i=0;i<num_outputs;i++){
                 struct wl_region *r = wl_compositor_create_region(compositor);
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-                wl_region_add(r, cx - 80, cy - 80, 160, 160);
+                wl_region_add(r, cx - 20, cy - 20, 40, 40);
                 wl_surface_set_input_region(outputs[i].surface, r);
                 wl_region_destroy(r);
                 wl_surface_commit(outputs[i].surface);
             }
             center_region_set = 1;
             LOG_INFO("Switched to center region (warp detection)");
+        }
+
+        /* Warp detected: expand to full for recapture */
+        if (need_full_recapture) {
+            for(int i=0;i<num_outputs;i++){
+                struct wl_region *r = wl_compositor_create_region(compositor);
+                wl_region_add(r, 0, 0, outputs[i].width, outputs[i].height);
+                wl_surface_set_input_region(outputs[i].surface, r);
+                wl_region_destroy(r);
+                wl_surface_commit(outputs[i].surface);
+            }
+            need_full_recapture = 0;
+            center_region_set = 0;
+            cursor_captured = 0;
+            LOG_INFO("Expanded to full region for warp recapture, waiting for cursor");
+            continue;
         }
 
         while (wl_display_prepare_read(display)!=0) wl_display_dispatch_pending(display);
