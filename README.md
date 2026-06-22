@@ -187,16 +187,26 @@ This is the best achievable solution within Wayland's security constraints — w
 After the initial 5-second calibration window, the input region shrinks to a **bullseye pattern** at each output's center:
 
 ```
-         │  2×100 vertical arm
-         │
-    ┌────┼────┐
-    │    │    │  ← 100×2 horizontal arm
-────┼────┼────┼────  (not to scale)
-    │ 10×10 │
-────┼─center─┼────
-    │       │
-    └───────┘
+                          ↑
+                          │  2×100 vertical arm
+                          │
+                          │
+                   ┌──────┼──────┐
+                   │      │      │
+                   │      │      │
+    ═══════════════╪══════╪══════╪═══════════════
+    100×2 horiz. →│ 10×10│      │← 100×2 horizontal arm
+    ═══════════════╪══════╪══════╪═══════════════
+                   │      │      │
+                   │      │      │
+                   └──────┼──────┘
+                          │
+                          │
+                          │
+                          ↓  2×100 vertical arm
 ```
+
+Only the cross-shaped lines (10×10 center square + horizontal/vertical arms) receive pointer events. The rest of the screen has full click passthrough.
 
 - **10×10 center** (100 px²): catches the cursor when it warps to the output center (niri `focus-monitor-*`)
 - **Horizontal arm** 100×2 (200 px²): catches cursor moving left/right from center
