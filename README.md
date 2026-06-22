@@ -187,10 +187,10 @@ This is the best achievable solution within Wayland's security constraints — w
 After the initial 5-second calibration window, the input region shrinks to a **bullseye pattern** at each output's center:
 
 ```
-         │  2×60 vertical arm
+         │  2×100 vertical arm
          │
     ┌────┼────┐
-    │    │    │  ← 60×2 horizontal arm
+    │    │    │  ← 100×2 horizontal arm
 ────┼────┼────┼────  (not to scale)
     │ 10×10 │
 ────┼─center─┼────
@@ -199,9 +199,9 @@ After the initial 5-second calibration window, the input region shrinks to a **b
 ```
 
 - **10×10 center** (100 px²): catches the cursor when it warps to the output center (niri `focus-monitor-*`)
-- **Horizontal arm** 60×2 (120 px²): catches cursor moving left/right from center
-- **Vertical arm** 2×60 (120 px²): catches cursor moving up/down from center
-- **Total area**: ~340 px² — less than 0.03% of a 1440×900 surface
+- **Horizontal arm** 100×2 (200 px²): catches cursor moving left/right from center
+- **Vertical arm** 2×100 (200 px²): catches cursor moving up/down from center
+- **Total area**: ~500 px² — less than 0.04% of a 1440×900 surface
 
 **Why this design?** When niri warps the cursor to another monitor, the cursor lands at the output center. If the cursor is hidden (niri's `hide-after-inactive-ms`), the compositor may delay sending `wl_pointer.enter` events. The bullseye arms catch the cursor as it moves away from center in any direction, providing a second chance at calibration. The minimal area ensures everyday clicks are virtually never blocked.
 
