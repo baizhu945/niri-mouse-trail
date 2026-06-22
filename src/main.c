@@ -66,8 +66,6 @@ static int timer_fd = -1;
 static int running = 1;
 static int need_redraw = 0;
 static int center_region_set = 0;
-static uint64_t last_pulse_time = 0;
-static int pulse_active = 0;
 
 static int color_cycle_on = 0;
 static double cycle_speed = 5.0;
@@ -560,43 +558,7 @@ int main(int argc, char *argv[]) {
                 wl_surface_commit(outputs[i].surface);
             }
             center_region_set = 1;
-            last_pulse_time = get_time_ms();
             LOG_INFO("Bullseye region active (10x10 center + cross)");
-        }
-
-        /* Periodic full-surface pulse for warp detection */
-        if (center_region_set && !pulse_active && get_time_ms() - last_pulse_time > 2000) {
-            for(int i=0;i<num_outputs;i++){
-                struct wl_region *r = wl_compositor_create_region(compositor);
-                wl_region_add(r, 0, 0, outputs[i].width, outputs[i].height);
-                wl_surface_set_input_region(outputs[i].surface, r);
-                wl_region_destroy(r);
-                wl_surface_commit(outputs[i].surface);
-            }
-            pulse_active = 1;
-            last_pulse_time = get_time_ms();
-            LOG_DEBUG("Pulse: full input region for warp detection");
-            continue;
-        }
-
-        /* End pulse after 100ms, back to bullseye */
-        if (pulse_active && get_time_ms() - last_pulse_time > 100) {
-            for(int i=0;i<num_outputs;i++){
-                struct wl_region *r = wl_compositor_create_region(compositor);
-                int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-                wl_region_add(r, cx - 5,  cy - 5,  10, 10);
-                wl_region_add(r, cx - 30, cy - 1,  60, 2);
-                wl_region_add(r, cx - 1,  cy - 30, 2,  60);
-                wl_surface_set_input_region(outputs[i].surface, r);
-                wl_region_destroy(r);
-                wl_surface_commit(outputs[i].surface);
-            }
-            pulse_active = 0;
-            last_pulse_time = get_time_ms();
-            LOG_DEBUG("Pulse: back to center region");
-
-            /* After pulse, skip rendering this frame */
-            continue;
         }
 
         while (wl_display_prepare_read(display)!=0) wl_display_dispatch_pending(display);
