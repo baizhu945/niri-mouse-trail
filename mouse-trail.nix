@@ -65,7 +65,7 @@ let
         echo "Usage: mouse-trail-ctl COMMAND [ARGS]"
         echo ""
         echo "Commands:"
-        echo "  color #RRGGBB     Set trail color (default: #ffffff)"
+        echo "  color RRGGBB     Set trail color (default: ffffff)"
         echo "  alpha N           Set trail opacity 0-1 (default: 1.0)"
         echo "  width N           Set head radius in px (default: 8)"
         echo "  speed N           Set trail duration in ms (default: 500)"

@@ -230,7 +230,9 @@ static void render_all(void) {
 static void handle_control_msg(const char *msg) {
     if (strncmp(msg, "color ", 6)==0) {
         unsigned int ri,gi,bi;
-        if (sscanf(msg+6,"#%02x%02x%02x",&ri,&gi,&bi)==3) { trail_set_color_rgb(&trail,ri/255.0,gi/255.0,bi/255.0); need_redraw=1; }
+        const char *c = msg + 6;
+        if (*c == '#') c++;
+        if (sscanf(c,"%02x%02x%02x",&ri,&gi,&bi)==3) { trail_set_color_rgb(&trail,ri/255.0,gi/255.0,bi/255.0); need_redraw=1; }
     } else if (strcmp(msg,"color-cycle on")==0) { color_cycle_on=1; need_redraw=1; }
     else if (strcmp(msg,"color-cycle off")==0) { color_cycle_on=0; need_redraw=1; }
     else if (strncmp(msg,"width ",6)==0) { trail.max_radius=atof(msg+6); need_redraw=1; }
@@ -325,7 +327,7 @@ static void parse_config(const char *path,
         while (*val == ' ' || *val == '\t') val++;
 
         if (strcmp(key, "import") == 0) { parse_config(val, cr, cg, cb, ca, width, length_ms, min_speed, smooth_factor, color_cycle_on, cycle_speed); }
-        else if (strcmp(key, "color") == 0) { unsigned int ri,gi,bi; if(sscanf(val,"#%02x%02x%02x",&ri,&gi,&bi)==3){ *cr=ri/255.0;*cg=gi/255.0;*cb=bi/255.0; } }
+        else if (strcmp(key, "color") == 0) { unsigned int ri,gi,bi; const char *cv = val; if (*cv=='#') cv++; if(sscanf(cv,"%02x%02x%02x",&ri,&gi,&bi)==3){ *cr=ri/255.0;*cg=gi/255.0;*cb=bi/255.0; } }
         else if (strcmp(key, "alpha") == 0) *ca = atof(val);
         else if (strcmp(key, "width") == 0) *width = atof(val);
         else if (strcmp(key, "length") == 0) *length_ms = (uint64_t)atoi(val);
@@ -343,7 +345,7 @@ static void usage(const char *p) {
         "Usage: %s [OPTIONS]\n"
         "  --config PATH       Config file (default: ~/.config/mouse-trail/config)\n"
         "  --device PATH       Input device (default: /dev/input/event2)\n"
-        "  --color #RRGGBB     Trail color\n  --alpha N       Opacity 0-1\n"
+        "  --color RRGGBB     Trail color (default: ffffff)\n  --alpha N       Opacity 0-1\n"
         "  --width N           Head radius px\n  --length N    Duration ms\n"
         "  --min-speed N       Stationary threshold px\n  --smooth-factor N EMA 0-1\n"
         "  --color-cycle on|off\n  --cycle-speed N  Cycle period s\n"
@@ -364,7 +366,10 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i],"--config")==0&&i+1<argc) config_path=argv[++i];
         else if (strcmp(argv[i],"--device")==0&&i+1<argc) device_path=argv[++i];
         else if (strcmp(argv[i],"--color")==0&&i+1<argc) {
-            unsigned int ri,gi,bi; if (sscanf(argv[++i],"#%02x%02x%02x",&ri,&gi,&bi)==3) { cr=ri/255.0;cg=gi/255.0;cb=bi/255.0; }
+            const char *c = argv[++i];
+            unsigned int ri,gi,bi;
+            if (*c == '#') c++;
+            if (sscanf(c,"%02x%02x%02x",&ri,&gi,&bi)==3) { cr=ri/255.0;cg=gi/255.0;cb=bi/255.0; }
         }
         else if (strcmp(argv[i],"--alpha")==0&&i+1<argc) ca=atof(argv[++i]);
         else if (strcmp(argv[i],"--width")==0&&i+1<argc) width=atof(argv[++i]);
