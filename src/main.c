@@ -551,14 +551,17 @@ int main(int argc, char *argv[]) {
             for(int i=0;i<num_outputs;i++){
                 struct wl_region *r = wl_compositor_create_region(compositor);
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-                wl_region_add(r, cx - 20, cy - 20, 40, 40);
+                /* Bullseye: 10x10 center + cross arms (60px each way) */
+                wl_region_add(r, cx - 5,  cy - 5,  10, 10);  /* center */
+                wl_region_add(r, cx - 30, cy - 1,  60, 2);   /* horizontal */
+                wl_region_add(r, cx - 1,  cy - 30, 2,  60);  /* vertical */
                 wl_surface_set_input_region(outputs[i].surface, r);
                 wl_region_destroy(r);
                 wl_surface_commit(outputs[i].surface);
             }
             center_region_set = 1;
             last_pulse_time = get_time_ms();
-            LOG_INFO("Switched to center region (warp detection)");
+            LOG_INFO("Bullseye region active (10x10 center + cross)");
         }
 
         /* Periodic full-surface pulse for warp detection */
@@ -576,12 +579,14 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        /* End pulse after 100ms, shrink back to center */
+        /* End pulse after 100ms, back to bullseye */
         if (pulse_active && get_time_ms() - last_pulse_time > 100) {
             for(int i=0;i<num_outputs;i++){
                 struct wl_region *r = wl_compositor_create_region(compositor);
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-                wl_region_add(r, cx - 20, cy - 20, 40, 40);
+                wl_region_add(r, cx - 5,  cy - 5,  10, 10);
+                wl_region_add(r, cx - 30, cy - 1,  60, 2);
+                wl_region_add(r, cx - 1,  cy - 30, 2,  60);
                 wl_surface_set_input_region(outputs[i].surface, r);
                 wl_region_destroy(r);
                 wl_surface_commit(outputs[i].surface);
