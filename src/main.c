@@ -177,7 +177,7 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
     else if (strcmp(interface, wl_shm_interface.name) == 0)
         shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
     else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0)
-        layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 3);
+        layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 2);
     else if (strcmp(interface, wl_output_interface.name) == 0) {
         if (num_outputs < MAX_OUTPUTS) {
             struct wl_output *o = wl_registry_bind(reg, name, &wl_output_interface, 3);
@@ -439,7 +439,7 @@ int main(int argc, char *argv[]) {
     if (!socket_path) { const char *xdg=getenv("XDG_RUNTIME_DIR"); static char sbuf[256]; snprintf(sbuf,sizeof(sbuf),"%s/mouse-trail.sock",xdg?xdg:"/tmp"); socket_path=sbuf; }
     if (ctl_cmd) return send_control_cmd(socket_path, ctl_cmd);
 
-    LOG_INFO("mouse-trail v0.4.1");
+    LOG_INFO("mouse-trail v0.11");
 
     input_fd = open(device_path, O_RDONLY|O_NONBLOCK);
     if (input_fd<0) { LOG_ERROR("Cannot open %s: %s",device_path,strerror(errno)); return 1; }
@@ -520,9 +520,6 @@ int main(int argc, char *argv[]) {
     }
     trail_set_position(&trail, est_x, est_y);
 
-    /* Keep full input region during init for cursor capture, then switch.
-       The tiny_region_set flag controls when we switch to center-only. */
-    int tiny_region_set = 0;
     LOG_INFO("Position: (%.0f,%.0f), %d outputs%s", est_x, est_y, num_outputs,
              cursor_captured ? " (captured)" : " (primary output center)");
 
