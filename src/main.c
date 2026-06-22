@@ -128,13 +128,34 @@ static void ptr_enter(void *data, struct wl_pointer *p,
             captured_cursor_x = outputs[i].global_x + psx;
             captured_cursor_y = outputs[i].global_y + psy;
             cursor_captured = 1;
-            LOG_INFO("Cursor captured: output=%d global=(%.0f,%.0f)", i, captured_cursor_x, captured_cursor_y);
+            pthread_mutex_lock(&input_mutex);
+            trail_set_position(&trail, captured_cursor_x, captured_cursor_y);
+            need_redraw = 1;
+            pthread_mutex_unlock(&input_mutex);
+            LOG_INFO("Cursor recalibrated via enter: output=%d global=(%.0f,%.0f)", i, captured_cursor_x, captured_cursor_y);
             return;
         }
     }
 }
 static void ptr_leave(void *d,struct wl_pointer *p,uint32_t s,struct wl_surface *sf){(void)d;(void)p;(void)s;(void)sf;}
-static void ptr_motion(void *d,struct wl_pointer *p,uint32_t t,wl_fixed_t sx,wl_fixed_t sy){(void)d;(void)p;(void)t;(void)sx;(void)sy;}
+static void ptr_motion(void *d,struct wl_pointer *p,uint32_t t,wl_fixed_t sx,wl_fixed_t sy){
+    (void)d;(void)p;(void)t;
+    double psx = wl_fixed_to_double(sx), psy = wl_fixed_to_double(sy);
+    for (int i = 0; i < num_outputs; i++) {
+        if (outputs[i].configured && psx >= 0 && psx < outputs[i].width &&
+            psy >= 0 && psy < outputs[i].height) {
+            pthread_mutex_lock(&input_mutex);
+            captured_cursor_x = outputs[i].global_x + psx;
+            captured_cursor_y = outputs[i].global_y + psy;
+            cursor_captured = 1;
+            trail_set_position(&trail, captured_cursor_x, captured_cursor_y);
+            need_redraw = 1;
+            pthread_mutex_unlock(&input_mutex);
+            LOG_DEBUG("Cursor recalibrated via motion: global=(%.0f,%.0f)", captured_cursor_x, captured_cursor_y);
+            return;
+        }
+    }
+}
 static void ptr_button(void *d,struct wl_pointer *p,uint32_t s,uint32_t t,uint32_t b,uint32_t st){(void)d;(void)p;(void)s;(void)t;(void)b;(void)st;}
 static void ptr_axis(void *d,struct wl_pointer *p,uint32_t t,uint32_t a,wl_fixed_t v){(void)d;(void)p;(void)t;(void)a;(void)v;}
 static void ptr_frame(void *d,struct wl_pointer *p){(void)d;(void)p;}
@@ -487,12 +508,20 @@ int main(int argc, char *argv[]) {
     }
     trail_set_position(&trail, est_x, est_y);
 
-    /* Set passthrough */
-    for(int i=0;i<num_outputs;i++){ struct wl_region*r=wl_compositor_create_region(compositor);
-        wl_surface_set_input_region(outputs[i].surface,r); wl_region_destroy(r); wl_surface_commit(outputs[i].surface); }
+    /* Set tiny input region at each output center for warp detection */
+    for(int i=0;i<num_outputs;i++){
+        struct wl_region *r = wl_compositor_create_region(compositor);
+        /* 4x4 pixel region at the output center (surface coords) */
+        int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
+        wl_region_add(r, cx - 2, cy - 2, 4, 4);
+        wl_surface_set_input_region(outputs[i].surface, r);
+        wl_region_destroy(r);
+        wl_surface_commit(outputs[i].surface);
+    }
     wl_display_roundtrip(display);
     LOG_INFO("Position: (%.0f,%.0f), %d outputs%s", est_x, est_y, num_outputs,
              cursor_captured ? " (captured)" : " (primary output center)");
+    LOG_INFO("Input regions: 4x4px at output centers (warp detection)");
 
     setup_control_socket(socket_path);
     start_time_ms = get_time_ms();
