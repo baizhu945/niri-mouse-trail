@@ -235,6 +235,7 @@ static void handle_control_msg(const char *msg) {
     else if (strcmp(msg,"color-cycle off")==0) { color_cycle_on=0; need_redraw=1; }
     else if (strncmp(msg,"width ",6)==0) { trail.max_radius=atof(msg+6); need_redraw=1; }
     else if (strncmp(msg,"speed ",6)==0) { trail.max_age_ms=(uint64_t)atoi(msg+6); need_redraw=1; }
+    else if (strncmp(msg,"alpha ",6)==0) { trail.a=atof(msg+6); need_redraw=1; }
     else if (strcmp(msg,"show")==0) { trail.visible=true; need_redraw=1; }
     else if (strcmp(msg,"hide")==0) { trail.visible=false; need_redraw=1; }
 }
@@ -298,30 +299,74 @@ static int send_control_cmd(const char *sock, const char *cmd) {
     close(fd); return 0;
 }
 
+/* Config file parser */
+#define MAX_CONFIG_INCLUDES 8
+static int config_include_count = 0;
+
+static void parse_config(const char *path,
+    double *cr, double *cg, double *cb, double *ca,
+    double *width, uint64_t *length_ms, double *min_speed, double *smooth_factor,
+    int *color_cycle_on, double *cycle_speed) {
+    if (config_include_count >= MAX_CONFIG_INCLUDES) return;
+    config_include_count++;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        char *nl = strchr(p, '\n'); if (nl) *nl = '\0';
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p, *val = eq + 1;
+        while (*key && (key[strlen(key)-1]==' '||key[strlen(key)-1]=='\t')) key[strlen(key)-1]='\0';
+        while (*val == ' ' || *val == '\t') val++;
+
+        if (strcmp(key, "import") == 0) { parse_config(val, cr, cg, cb, ca, width, length_ms, min_speed, smooth_factor, color_cycle_on, cycle_speed); }
+        else if (strcmp(key, "color") == 0) { unsigned int ri,gi,bi; if(sscanf(val,"#%02x%02x%02x",&ri,&gi,&bi)==3){ *cr=ri/255.0;*cg=gi/255.0;*cb=bi/255.0; } }
+        else if (strcmp(key, "alpha") == 0) *ca = atof(val);
+        else if (strcmp(key, "width") == 0) *width = atof(val);
+        else if (strcmp(key, "length") == 0) *length_ms = (uint64_t)atoi(val);
+        else if (strcmp(key, "min_speed") == 0) *min_speed = atof(val);
+        else if (strcmp(key, "smooth_factor") == 0) *smooth_factor = atof(val);
+        else if (strcmp(key, "color_cycle") == 0) *color_cycle_on = (strcmp(val, "on") == 0);
+        else if (strcmp(key, "cycle_speed") == 0) *cycle_speed = atof(val);
+        else if (strcmp(key, "device") == 0) { /* device_path handled externally */ }
+    }
+    fclose(f);
+}
+
 static void usage(const char *p) {
-    fprintf(stderr,
+        fprintf(stderr,
         "Usage: %s [OPTIONS]\n"
+        "  --config PATH       Config file (default: ~/.config/mouse-trail/config)\n"
         "  --device PATH       Input device (default: /dev/input/event2)\n"
-        "  --color #RRGGBB     Trail color\n  --width N      Head radius px\n"
-        "  --length N          Duration ms\n  --min-speed N   Stationary threshold px\n"
-        "  --smooth-factor N   EMA 0-1\n  --color-cycle on|off\n"
-        "  --cycle-speed N     Cycle period s\n  --socket PATH\n"
+        "  --color #RRGGBB     Trail color\n  --alpha N       Opacity 0-1\n"
+        "  --width N           Head radius px\n  --length N    Duration ms\n"
+        "  --min-speed N       Stationary threshold px\n  --smooth-factor N EMA 0-1\n"
+        "  --color-cycle on|off\n  --cycle-speed N  Cycle period s\n"
+        "  --socket PATH       Control socket path\n"
         "  --log-level debug|info|warn|error\n  --log-file PATH\n"
         "  --ctl \"CMD\"         Send command\n  --help\n", p);
-}
+    }
 
 int main(int argc, char *argv[]) {
     const char *device_path = "/dev/input/event2";
     double cr=1.0,cg=1.0,cb=1.0,ca=1.0, width=8.0;
     uint64_t length_ms=500; double min_speed=2.0, smooth_factor=0.6;
     int log_level=1; const char *log_path=NULL, *socket_path=NULL, *ctl_cmd=NULL;
+    const char *config_path = NULL;
 
     for (int i=1;i<argc;i++) {
         if (strcmp(argv[i],"--help")==0) { usage(argv[0]); return 0; }
+        else if (strcmp(argv[i],"--config")==0&&i+1<argc) config_path=argv[++i];
         else if (strcmp(argv[i],"--device")==0&&i+1<argc) device_path=argv[++i];
         else if (strcmp(argv[i],"--color")==0&&i+1<argc) {
             unsigned int ri,gi,bi; if (sscanf(argv[++i],"#%02x%02x%02x",&ri,&gi,&bi)==3) { cr=ri/255.0;cg=gi/255.0;cb=bi/255.0; }
         }
+        else if (strcmp(argv[i],"--alpha")==0&&i+1<argc) ca=atof(argv[++i]);
         else if (strcmp(argv[i],"--width")==0&&i+1<argc) width=atof(argv[++i]);
         else if (strcmp(argv[i],"--length")==0&&i+1<argc) length_ms=(uint64_t)atoi(argv[++i]);
         else if (strcmp(argv[i],"--min-speed")==0&&i+1<argc) min_speed=atof(argv[++i]);
@@ -338,6 +383,16 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i],"--ctl")==0&&i+1<argc) ctl_cmd=argv[++i];
         else { fprintf(stderr,"Unknown: %s\n",argv[i]); usage(argv[0]); return 1; }
     }
+
+    /* Load config file (default: ~/.config/mouse-trail/config) */
+    if (!config_path) {
+        const char *home = getenv("HOME");
+        static char def_cfg[512];
+        if (home) snprintf(def_cfg, sizeof(def_cfg), "%s/.config/mouse-trail/config", home);
+        else snprintf(def_cfg, sizeof(def_cfg), "/tmp/mouse-trail-config");
+        config_path = def_cfg;
+    }
+    parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms, &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed);
 
     if (log_path && strcmp(log_path,"-")!=0 && ctl_cmd==NULL) { FILE *f=fopen(log_path,"a"); if(f)log_init(f,log_level); else{log_init(stderr,log_level);LOG_ERROR("Cannot open: %s",log_path);} }
     else log_init(stderr, log_level);
