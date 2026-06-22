@@ -447,15 +447,18 @@ int main(int argc, char *argv[]) {
                     double raw_dist = sqrt(dx*dx + dy*dy);
                     if (raw_dist >= trail.min_speed) {
                         trail.stationary_start = 0;
-                        /* Clamp delta to screen bounds BEFORE feeding trail */
-                        double new_x = trail.pos_x + dx;
-                        double new_y = trail.pos_y + dy;
-                        if (new_x < bounds_min_x) dx = bounds_min_x - trail.pos_x;
-                        if (new_x > bounds_max_x) dx = bounds_max_x - trail.pos_x;
-                        if (new_y < bounds_min_y) dy = bounds_min_y - trail.pos_y;
-                        if (new_y > bounds_max_y) dy = bounds_max_y - trail.pos_y;
-                        if (dx != 0.0 || dy != 0.0)
-                            trail_feed(&trail, dx, dy, now);
+                        /* Clamp position first, then feed */
+                        double old_x = trail.pos_x, old_y = trail.pos_y;
+                        trail.pos_x += dx;
+                        trail.pos_y += dy;
+                        if (trail.pos_x < bounds_min_x) trail.pos_x = bounds_min_x;
+                        if (trail.pos_x > bounds_max_x) trail.pos_x = bounds_max_x;
+                        if (trail.pos_y < bounds_min_y) trail.pos_y = bounds_min_y;
+                        if (trail.pos_y > bounds_max_y) trail.pos_y = bounds_max_y;
+                        double clamped_dx = trail.pos_x - old_x;
+                        double clamped_dy = trail.pos_y - old_y;
+                        if (clamped_dx != 0.0 || clamped_dy != 0.0)
+                            trail_feed(&trail, clamped_dx, clamped_dy, now);
                     } else if (trail.stationary_start == 0) {
                         trail.stationary_start = now;
                     }
