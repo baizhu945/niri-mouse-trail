@@ -28,17 +28,14 @@ int trail_feed(trail_state_t *t, double rel_x, double rel_y, uint64_t now_ms) {
     if (!t->visible) return 0;
     if (rel_x == 0.0 && rel_y == 0.0) return 0;
 
-    /* Shift all existing points away from cursor by the movement delta */
-    for (int i = 0; i < t->count; i++) {
-        int idx = (t->head + i) % MAX_TRAIL_POINTS;
-        t->points[idx].x -= rel_x;
-        t->points[idx].y -= rel_y;
-    }
+    /* Update cursor position */
+    t->pos_x += rel_x;
+    t->pos_y += rel_y;
 
-    /* Add new point at (0,0) — current cursor position in trail-local coords */
+    /* Add point at current absolute position */
     int idx = (t->head + t->count) % MAX_TRAIL_POINTS;
-    t->points[idx].x = 0.0;
-    t->points[idx].y = 0.0;
+    t->points[idx].x = t->pos_x;
+    t->points[idx].y = t->pos_y;
     t->points[idx].timestamp_ms = now_ms;
 
     if (t->count < MAX_TRAIL_POINTS) {
@@ -46,10 +43,6 @@ int trail_feed(trail_state_t *t, double rel_x, double rel_y, uint64_t now_ms) {
     } else {
         t->head = (t->head + 1) % MAX_TRAIL_POINTS;
     }
-
-    /* Update estimated cursor position */
-    t->pos_x += rel_x;
-    t->pos_y += rel_y;
 
     LOG_DEBUG("trail: point added pos=(%.1f,%.1f) count=%d",
               t->pos_x, t->pos_y, t->count);
@@ -158,25 +151,24 @@ int main(void) {
     assert(t.pos_x == 640.0 && t.pos_y == 480.0);
     printf("PASS\n");
 
-    printf("=== Test 3: trail_feed adds point at (0,0) ===\n");
+    printf("=== Test 3: trail_feed adds point at absolute position ===\n");
     uint64_t t0 = 1000;
     int moved = trail_feed(&t, 10.0, 5.0, t0);
     assert(moved == 1);
     assert(t.count == 1);
-    assert(t.points[t.head].x == 0.0 && t.points[t.head].y == 0.0);
     assert(t.pos_x == 650.0 && t.pos_y == 485.0);
-    printf("PASS: count=%d pos=(%.1f,%.1f)\n", t.count, t.pos_x, t.pos_y);
+    assert(t.points[t.head].x == 650.0 && t.points[t.head].y == 485.0);
+    printf("PASS: count=%d pos=(%.1f,%.1f) pt=(%.1f,%.1f)\n",
+           t.count, t.pos_x, t.pos_y, t.points[t.head].x, t.points[t.head].y);
 
-    printf("=== Test 4: second movement shifts old point away ===\n");
+    printf("=== Test 4: second movement, each at own position ===\n");
     trail_feed(&t, 20.0, 0.0, t0 + 10);
     assert(t.count == 2);
-    /* Old point at head should be at (-20, 0) — shifted left */
-    assert(t.points[t.head].x == -20.0 && t.points[t.head].y == 0.0);
-    /* New point at tail should be at (0, 0) */
-    int new_idx = (t.head + 1) % MAX_TRAIL_POINTS;
-    assert(t.points[new_idx].x == 0.0 && t.points[new_idx].y == 0.0);
     assert(t.pos_x == 670.0);
-    printf("PASS: old=(-20,0) new=(0,0) pos_x=%.1f\n", t.pos_x);
+    int new_idx = (t.head + 1) % MAX_TRAIL_POINTS;
+    assert(t.points[t.head].x == 650.0 && t.points[t.head].y == 485.0);
+    assert(t.points[new_idx].x == 670.0 && t.points[new_idx].y == 485.0);
+    printf("PASS: old=(650,485) new=(670,485) pos_x=%.1f\n", t.pos_x);
 
     printf("=== Test 5: trail_render relative coords ===\n");
     render_count = 0;

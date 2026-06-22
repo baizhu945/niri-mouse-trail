@@ -214,7 +214,7 @@ static void render_output(output_t *out) {
     cairo_t *cr = cairo_create(cs);
     cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR); cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-    cairo_translate(cr, trail.pos_x - out->global_x, trail.pos_y - out->global_y);
+    cairo_translate(cr, -(double)out->global_x, -(double)out->global_y);
     trail_render(&trail, get_time_ms(), draw_trail_point, cr);
     cairo_destroy(cr); cairo_surface_destroy(cs);
     wl_surface_attach(out->surface, buf, 0, 0);
