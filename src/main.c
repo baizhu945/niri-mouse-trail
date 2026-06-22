@@ -68,6 +68,10 @@ static int need_redraw = 0;
 static int color_cycle_on = 0;
 static double cycle_speed = 5.0;
 
+/* Screen bounds for cursor clamping */
+static double bounds_min_x = 0, bounds_min_y = 0;
+static double bounds_max_x = 0, bounds_max_y = 0;
+
 static uint64_t get_time_ms(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
@@ -85,17 +89,6 @@ static void hsl_to_rgb(double h, double s, double l, double *r, double *g, doubl
     double q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
     double p = 2.0 * l - q;
     *r = hue2rgb(p, q, h + 1.0/3.0); *g = hue2rgb(p, q, h); *b = hue2rgb(p, q, h - 1.0/3.0);
-}
-
-/* Get scale of the output containing (x, y) in global coords */
-static double get_active_scale(double gx, double gy) {
-    for (int i = 0; i < num_outputs; i++) {
-        output_t *o = &outputs[i];
-        if (gx >= o->global_x && gx < o->global_x + o->phys_w &&
-            gy >= o->global_y && gy < o->global_y + o->phys_h)
-            return o->scale > 0 ? o->scale : 1.0;
-    }
-    return 1.0;
 }
 
 static void output_geometry(void *data, struct wl_output *wo,
@@ -356,9 +349,11 @@ int main(int argc, char *argv[]) {
     double est_x=0,est_y=0;
     { int mix=0,maxx=0,miy=0,may=0;
       for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
-        if(o->global_x<mix)mix=o->global_x; if(o->global_x+o->width>maxx)maxx=o->global_x+o->width;
-        if(o->global_y<miy)miy=o->global_y; if(o->global_y+o->height>may)may=o->global_y+o->height; }
-      est_x=(mix+maxx)/2.0; est_y=(miy+may)/2.0; }
+        if(o->global_x<mix)mix=o->global_x; if(o->global_x+o->phys_w>maxx)maxx=o->global_x+o->phys_w;
+        if(o->global_y<miy)miy=o->global_y; if(o->global_y+o->phys_h>may)may=o->global_y+o->phys_h; }
+      est_x=(mix+maxx)/2.0; est_y=(miy+may)/2.0;
+      bounds_min_x=mix; bounds_max_x=maxx; bounds_min_y=miy; bounds_max_y=may;
+      LOG_INFO("Bounds: x=[%d,%d] y=[%d,%d]", mix, maxx, miy, may); }
 
     for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
         o->surface=wl_compositor_create_surface(compositor);
@@ -385,6 +380,16 @@ int main(int argc, char *argv[]) {
         wl_surface_damage_buffer(o->surface,0,0,o->width,o->height);
         wl_surface_commit(o->surface); wl_buffer_destroy(b); munmap(d,size); }
     wl_display_roundtrip(display);
+
+    /* Brief dispatch loop to capture cursor before setting passthrough */
+    if (pointer && !cursor_captured) {
+        uint64_t wait_start = get_time_ms();
+        while (!cursor_captured && get_time_ms() - wait_start < 500) {
+            if (wl_display_prepare_read(display) == 0) wl_display_read_events(display);
+            wl_display_dispatch_pending(display);
+            if (!cursor_captured) usleep(10000);
+        }
+    }
 
     if (cursor_captured) { est_x=captured_cursor_x; est_y=captured_cursor_y; }
     trail_set_position(&trail, est_x, est_y);
@@ -433,6 +438,11 @@ int main(int argc, char *argv[]) {
                     if (raw_dist >= trail.min_speed) {
                         trail.stationary_start = 0;
                         trail_feed(&trail, dx, dy, now);
+                        /* Clamp cursor to screen bounds */
+                        if (trail.pos_x < bounds_min_x) trail.pos_x = bounds_min_x;
+                        if (trail.pos_x > bounds_max_x) trail.pos_x = bounds_max_x;
+                        if (trail.pos_y < bounds_min_y) trail.pos_y = bounds_min_y;
+                        if (trail.pos_y > bounds_max_y) trail.pos_y = bounds_max_y;
                     } else if (trail.stationary_start == 0) {
                         trail.stationary_start = now;
                     }
