@@ -51,10 +51,10 @@ let
 
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         kill "$(cat "$PIDFILE")" 2>/dev/null || true
-        rm -f "$PIDFILE" "$SOCK"
+        remove-without-permission -f "$PIDFILE" "$SOCK"
         ${pkgs.libnotify}/bin/notify-send "Mouse Trail" "已关闭" 2>/dev/null || true
     else
-        rm -f "$PIDFILE" "$SOCK"
+        remove-without-permission -f "$PIDFILE" "$SOCK"
         ${mouse-trail-pkg}/bin/mouse-trail &
         echo $! > "$PIDFILE"
         sleep 0.2
