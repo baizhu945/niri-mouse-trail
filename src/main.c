@@ -40,9 +40,15 @@ static struct wl_registry *registry = NULL;
 static struct wl_compositor *compositor = NULL;
 static struct wl_shm *shm = NULL;
 static struct zwlr_layer_shell_v1 *layer_shell = NULL;
+static struct wl_seat *seat = NULL;
+static struct wl_pointer *pointer = NULL;
 
 static output_t outputs[MAX_OUTPUTS];
 static int num_outputs = 0;
+
+/* Cursor capture */
+static double captured_cursor_x = 0, captured_cursor_y = 0;
+static int cursor_captured = 0;
 
 static trail_state_t trail;
 static uint64_t start_time_ms = 0;
@@ -130,6 +136,70 @@ static const struct wl_output_listener output_listener = {
     .description = output_desc,
 };
 
+/* wl_pointer listener — capture cursor position from enter or motion */
+static void ptr_enter(void *data, struct wl_pointer *p,
+                       uint32_t serial, struct wl_surface *surface,
+                       wl_fixed_t sx, wl_fixed_t sy) {
+    (void)data; (void)p; (void)serial;
+    if (cursor_captured) return;
+    double psx = wl_fixed_to_double(sx);
+    double psy = wl_fixed_to_double(sy);
+    LOG_INFO("ptr_enter: surface=%p sx=%.0f sy=%.0f num_outputs=%d",
+             (void*)surface, psx, psy, num_outputs);
+    for (int i = 0; i < num_outputs; i++) {
+        LOG_INFO("  output[%d] surface=%p", i, (void*)outputs[i].surface);
+        if (outputs[i].surface == surface) {
+            captured_cursor_x = outputs[i].global_x + psx;
+            captured_cursor_y = outputs[i].global_y + psy;
+            cursor_captured = 1;
+            LOG_INFO("Cursor captured via enter: output=%d global=(%.0f,%.0f)",
+                     i, captured_cursor_x, captured_cursor_y);
+            return;
+        }
+    }
+}
+
+static void ptr_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf)
+    { (void)d; (void)p; (void)s; (void)sf; }
+
+static void ptr_motion(void *data, struct wl_pointer *p,
+                        uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
+    (void)data; (void)p; (void)time;
+    if (cursor_captured) return;
+    /* Motion gives us the cursor position too — use as fallback */
+    double psx = wl_fixed_to_double(sx);
+    double psy = wl_fixed_to_double(sy);
+    /* We don't know which surface the motion is on, 
+       try to match any output that contains this coordinate */
+    for (int i = 0; i < num_outputs; i++) {
+        if (outputs[i].configured &&
+            psx >= 0 && psx < outputs[i].width &&
+            psy >= 0 && psy < outputs[i].height) {
+            captured_cursor_x = outputs[i].global_x + psx;
+            captured_cursor_y = outputs[i].global_y + psy;
+            cursor_captured = 1;
+            LOG_INFO("Cursor captured via motion: output=%d global=(%.0f,%.0f)",
+                     i, captured_cursor_x, captured_cursor_y);
+            return;
+        }
+    }
+}
+
+static void ptr_button(void *d, struct wl_pointer *p, uint32_t s, uint32_t t,
+                        uint32_t b, uint32_t st) { (void)d;(void)p;(void)s;(void)t;(void)b;(void)st; }
+static void ptr_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v)
+    { (void)d;(void)p;(void)t;(void)a;(void)v; }
+static void ptr_frame(void *d, struct wl_pointer *p) { (void)d;(void)p; }
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = ptr_enter,
+    .leave = ptr_leave,
+    .motion = ptr_motion,
+    .button = ptr_button,
+    .axis = ptr_axis,
+    .frame = ptr_frame,
+};
+
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
                              const char *interface, uint32_t version) {
     (void)data;
@@ -155,6 +225,12 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
             outputs[num_outputs].height = 0;
             num_outputs++;
             LOG_INFO("Bound wl_output (#%d)", num_outputs - 1);
+        }
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        if (!seat) {
+            seat = wl_registry_bind(reg, name, &wl_seat_interface, 5);
+            pointer = wl_seat_get_pointer(seat);
+            LOG_INFO("Bound wl_seat + wl_pointer");
         }
     }
 }
@@ -436,7 +512,12 @@ int main(int argc, char *argv[]) {
     /* Get output geometry */
     wl_display_roundtrip(display);
 
-    /* Calc center for initial pos estimate */
+    /* Register pointer listener before creating surfaces */
+    if (pointer) {
+        wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+    }
+
+    /* Estimate cursor position from screen geometry */
     double est_x = 0, est_y = 0;
     {
         int min_x = 0, max_x = 0, min_y = 0, max_y = 0;
@@ -450,11 +531,16 @@ int main(int argc, char *argv[]) {
         est_x = (min_x + max_x) / 2.0;
         est_y = (min_y + max_y) / 2.0;
     }
+    if (cursor_captured) {
+        est_x = captured_cursor_x;
+        est_y = captured_cursor_y;
+    }
 
     /* Create layer surfaces */
     for (int i = 0; i < num_outputs; i++) {
         output_t *out = &outputs[i];
         out->surface = wl_compositor_create_surface(compositor);
+        LOG_INFO("Output %d surface: %p", i, (void*)out->surface);
         out->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
             layer_shell, out->surface, out->wl_output,
             ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "mouse-trail");
@@ -491,19 +577,9 @@ int main(int argc, char *argv[]) {
     }
     wl_display_roundtrip(display);
 
-    /* Set passthrough */
-    for (int i = 0; i < num_outputs; i++) {
-        struct wl_region *r = wl_compositor_create_region(compositor);
-        wl_surface_set_input_region(outputs[i].surface, r);
-        wl_region_destroy(r);
-        wl_surface_commit(outputs[i].surface);
-    }
-    wl_display_roundtrip(display);
-    LOG_INFO("Passthrough set, %d outputs mapped", num_outputs);
-
-    /* Use estimated center as initial cursor position */
+    /* Use initial estimate */
     trail_set_position(&trail, est_x, est_y);
-    LOG_INFO("Initial position estimate: (%.0f, %.0f)", est_x, est_y);
+    LOG_INFO("Position: (%.0f, %.0f)", est_x, est_y);
 
     setup_control_socket(socket_path);
     start_time_ms = get_time_ms();
@@ -522,7 +598,41 @@ int main(int argc, char *argv[]) {
         epoll_ctl(epfd, EPOLL_CTL_ADD, ctrl_fd, &evt);
     }
 
-    LOG_INFO("Main loop (%d outputs)", num_outputs);
+    /* Init phase: run main loop with normal input region until cursor captured */
+    int passthrough_set = 0;
+    LOG_INFO("Init phase: waiting for cursor (up to 0.5s)");
+
+    while (running && !passthrough_set) {
+        while (wl_display_prepare_read(display) != 0)
+            wl_display_dispatch_pending(display);
+        wl_display_flush(display);
+
+        struct epoll_event events[4];
+        int n = epoll_wait(epfd, events, 4, 50);
+        wl_display_read_events(display);
+        wl_display_dispatch_pending(display);
+
+        /* Check if cursor captured via ptr_enter or ptr_motion */
+        if (cursor_captured) {
+            trail_set_position(&trail, captured_cursor_x, captured_cursor_y);
+            LOG_INFO("Cursor captured: (%.0f, %.0f)", captured_cursor_x, captured_cursor_y);
+        }
+
+        /* Set passthrough after cursor captured or 3s timeout */
+        if (cursor_captured || get_time_ms() - start_time_ms > 500) {
+            for (int i = 0; i < num_outputs; i++) {
+                struct wl_region *r = wl_compositor_create_region(compositor);
+                wl_surface_set_input_region(outputs[i].surface, r);
+                wl_region_destroy(r);
+                wl_surface_commit(outputs[i].surface);
+            }
+            passthrough_set = 1;
+            LOG_INFO("Passthrough set (%d outputs)", num_outputs);
+            break;
+        }
+    }
+
+    LOG_INFO("Main loop");
 
     while (running) {
         while (wl_display_prepare_read(display) != 0)
@@ -585,6 +695,8 @@ int main(int argc, char *argv[]) {
     if (compositor) wl_compositor_destroy(compositor);
     if (shm) wl_shm_destroy(shm);
     if (layer_shell) zwlr_layer_shell_v1_destroy(layer_shell);
+    if (pointer) wl_pointer_destroy(pointer);
+    if (seat) wl_seat_destroy(seat);
     if (registry) wl_registry_destroy(registry);
     if (display) wl_display_disconnect(display);
     if (evdev) libevdev_free(evdev);
