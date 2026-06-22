@@ -2,6 +2,8 @@
 
 A beautiful, meteor-like mouse cursor trail overlay for Wayland compositors (niri, Sway, Hyprland, etc.) built with wlr-layer-shell and Cairo.
 
+[中文](README.zh-CN.md)
+
 ![demo](https://img.shields.io/badge/version-0.9-blue)
 
 ---
