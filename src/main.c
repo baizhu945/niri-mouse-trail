@@ -524,6 +524,40 @@ int main(int argc, char *argv[]) {
     int tiny_region_set = 0;
     LOG_INFO("Position: (%.0f,%.0f), %d outputs%s", est_x, est_y, num_outputs,
              cursor_captured ? " (captured)" : " (primary output center)");
+
+    setup_control_socket(socket_path);
+    start_time_ms = get_time_ms();
+    pthread_create(&input_thread, NULL, input_thread_fn, NULL);
+
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    struct itimerspec its = {{0,16666667},{0,1}};
+    timerfd_settime(timer_fd, 0, &its, NULL);
+    int epfd = epoll_create1(0);
+    struct epoll_event evt; evt.events=EPOLLIN;
+    evt.data.fd=timer_fd; epoll_ctl(epfd,EPOLL_CTL_ADD,timer_fd,&evt);
+    if(ctrl_fd>=0){ evt.data.fd=ctrl_fd; epoll_ctl(epfd,EPOLL_CTL_ADD,ctrl_fd,&evt); }
+    int display_fd = wl_display_get_fd(display);
+    evt.data.fd = display_fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, display_fd, &evt);
+
+    int center_region_set = 0;
+
+    LOG_INFO("Main loop");
+
+    while (running) {
+        /* After cursor captured or 5s, shrink to center region */
+        if (!center_region_set && (cursor_captured || get_time_ms() - start_time_ms > 5000)) {
+            for(int i=0;i<num_outputs;i++){
+                struct wl_region *r = wl_compositor_create_region(compositor);
+                int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
+                wl_region_add(r, cx - 80, cy - 80, 160, 160);
+                wl_surface_set_input_region(outputs[i].surface, r);
+                wl_region_destroy(r);
+                wl_surface_commit(outputs[i].surface);
+            }
+            center_region_set = 1;
+            LOG_INFO("Switched to center region (warp detection)");
+        }
     LOG_INFO("Input regions: 4x4px at output centers (warp detection)");
 
     setup_control_socket(socket_path);
