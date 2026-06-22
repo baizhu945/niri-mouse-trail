@@ -550,7 +550,7 @@ int main(int argc, char *argv[]) {
             for(int i=0;i<num_outputs;i++){
                 struct wl_region *r = wl_compositor_create_region(compositor);
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-                wl_region_add(r, cx - 20, cy - 20, 40, 40);
+                wl_region_add(r, cx - 80, cy - 80, 160, 160);
                 wl_surface_set_input_region(outputs[i].surface, r);
                 wl_region_destroy(r);
                 wl_surface_commit(outputs[i].surface);
