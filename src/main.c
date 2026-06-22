@@ -558,40 +558,6 @@ int main(int argc, char *argv[]) {
             center_region_set = 1;
             LOG_INFO("Switched to center region (warp detection)");
         }
-    LOG_INFO("Input regions: 4x4px at output centers (warp detection)");
-
-    setup_control_socket(socket_path);
-    start_time_ms = get_time_ms();
-    pthread_create(&input_thread, NULL, input_thread_fn, NULL);
-
-    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-    struct itimerspec its = {{0,16666667},{0,1}};
-    timerfd_settime(timer_fd, 0, &its, NULL);
-    int epfd = epoll_create1(0);
-    struct epoll_event evt; evt.events=EPOLLIN;
-    evt.data.fd=timer_fd; epoll_ctl(epfd,EPOLL_CTL_ADD,timer_fd,&evt);
-    if(ctrl_fd>=0){ evt.data.fd=ctrl_fd; epoll_ctl(epfd,EPOLL_CTL_ADD,ctrl_fd,&evt); }
-    /* Add display fd for immediate Wayland event dispatch */
-    int display_fd = wl_display_get_fd(display);
-    evt.data.fd = display_fd;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, display_fd, &evt);
-
-    LOG_INFO("Main loop");
-
-    while (running) {
-        /* Transition from full input to center-only after cursor captured or 5s */
-        if (!tiny_region_set && (cursor_captured || get_time_ms() - start_time_ms > 5000)) {
-            for(int i=0;i<num_outputs;i++){
-                struct wl_region *r = wl_compositor_create_region(compositor);
-                int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-                wl_region_add(r, cx - 80, cy - 80, 160, 160);
-                wl_surface_set_input_region(outputs[i].surface, r);
-                wl_region_destroy(r);
-                wl_surface_commit(outputs[i].surface);
-            }
-            tiny_region_set = 1;
-            LOG_INFO("Switched to center input region (warp detection)");
-        }
 
         while (wl_display_prepare_read(display)!=0) wl_display_dispatch_pending(display);
         wl_display_flush(display);
