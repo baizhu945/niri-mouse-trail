@@ -161,6 +161,54 @@ To fix, change these lines in `mouse-trail.nix`:
 
 ---
 
+## Design Notes
+
+### Wayland Security vs. Cursor Position Accuracy
+
+Wayland intentionally prevents clients from querying the global cursor position. This is a security feature — a malicious client should not be able to track the user's cursor without their knowledge. However, this creates a fundamental challenge for cursor trail effects, which inherently need to know where the cursor is.
+
+**The trade-off:**
+
+| Method | Accuracy | Click Passthrough | Reliability |
+|--------|----------|-------------------|-------------|
+| `wl_pointer` (surface-relative) | Perfect | ❌ Blocks clicks | Only on own surface |
+| evdev (`/dev/input/event*`) | Good (1:1 with flat accel) | ✅ Full passthrough | Always available |
+| `zwp_relative_pointer_manager_v1` | Perfect | ✅ | ❌ Not supported by niri |
+
+**Our hybrid approach:**
+- **Continuous tracking**: raw evdev events processed per-event with screen-edge clamping (same behavior as the compositor)
+- **Startup calibration**: full-surface `wl_pointer` capture during first 5 seconds of operation
+- **Drift correction**: bullseye input region provides periodic ground-truth from the compositor
+
+This is the best achievable solution within Wayland's security constraints — we cannot query the cursor position directly, so we combine evdev tracking with opportunistic compositor calibration.
+
+### Bullseye Input Region
+
+After the initial 5-second calibration window, the input region shrinks to a **bullseye pattern** at each output's center:
+
+```
+         │  2×60 vertical arm
+         │
+    ┌────┼────┐
+    │    │    │  ← 60×2 horizontal arm
+────┼────┼────┼────  (not to scale)
+    │ 10×10 │
+────┼─center─┼────
+    │       │
+    └───────┘
+```
+
+- **10×10 center** (100 px²): catches the cursor when it warps to the output center (niri `focus-monitor-*`)
+- **Horizontal arm** 60×2 (120 px²): catches cursor moving left/right from center
+- **Vertical arm** 2×60 (120 px²): catches cursor moving up/down from center
+- **Total area**: ~340 px² — less than 0.03% of a 1440×900 surface
+
+**Why this design?** When niri warps the cursor to another monitor, the cursor lands at the output center. If the cursor is hidden (niri's `hide-after-inactive-ms`), the compositor may delay sending `wl_pointer.enter` events. The bullseye arms catch the cursor as it moves away from center in any direction, providing a second chance at calibration. The minimal area ensures everyday clicks are virtually never blocked.
+
+**Why 5-second full surface at startup?** The initial full-surface window guarantees the cursor position is captured immediately when the trail is first enabled, even if the cursor is stationary. After capture, the bullseye handles subsequent warps.
+
+---
+
 ## Architecture
 
 ```
