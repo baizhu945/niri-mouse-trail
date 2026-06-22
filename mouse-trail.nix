@@ -61,6 +61,19 @@ let
 
   ctl-script = pkgs.writeShellScriptBin "mouse-trail-ctl" ''
     set -euo pipefail
+    if [ "''${1:-}" = "help" ] || [ "$#" -eq 0 ]; then
+        echo "Usage: mouse-trail-ctl COMMAND [ARGS]"
+        echo ""
+        echo "Commands:"
+        echo "  color #RRGGBB     Set trail color"
+        echo "  alpha N           Set trail opacity (0-1)"
+        echo "  width N           Set head radius in px"
+        echo "  speed N           Set trail duration in ms"
+        echo "  color-cycle on|off  Enable/disable color cycling"
+        echo "  show / hide       Show or hide trail"
+        echo "  help              Show this help"
+        exit 0
+    fi
     SOCK="$XDG_RUNTIME_DIR/mouse-trail.sock"
     if [ ! -S "$SOCK" ]; then
         echo "mouse-trail is not running (socket $SOCK not found)" >&2
