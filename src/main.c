@@ -466,24 +466,28 @@ int main(int argc, char *argv[]) {
         wl_surface_commit(o->surface); wl_buffer_destroy(b); munmap(d,size); }
     wl_display_roundtrip(display);
 
-    /* Brief dispatch loop to capture cursor before setting passthrough */
-    if (pointer && !cursor_captured) {
-        uint64_t wait_start = get_time_ms();
-        while (!cursor_captured && get_time_ms() - wait_start < 500) {
-            if (wl_display_prepare_read(display) == 0) wl_display_read_events(display);
-            wl_display_dispatch_pending(display);
-            if (!cursor_captured) usleep(10000);
-        }
+    /* Retry cursor capture with multiple roundtrips */
+    for (int retry = 0; retry < 8 && pointer && !cursor_captured; retry++) {
+        usleep(30000);
+        wl_display_roundtrip(display);
+        LOG_INFO("Capture retry %d: captured=%d", retry, cursor_captured);
     }
 
     if (cursor_captured) { est_x=captured_cursor_x; est_y=captured_cursor_y; }
+    else {
+        /* Fallback: center of first (primary) output in logical coords */
+        est_x = outputs[0].global_x + outputs[0].width / 2.0;
+        est_y = outputs[0].global_y + outputs[0].height / 2.0;
+        LOG_INFO("Cursor not captured, using output 0 center");
+    }
     trail_set_position(&trail, est_x, est_y);
 
     /* Set passthrough */
     for(int i=0;i<num_outputs;i++){ struct wl_region*r=wl_compositor_create_region(compositor);
         wl_surface_set_input_region(outputs[i].surface,r); wl_region_destroy(r); wl_surface_commit(outputs[i].surface); }
     wl_display_roundtrip(display);
-    LOG_INFO("Position: (%.0f,%.0f), %d outputs%s", est_x, est_y, num_outputs, cursor_captured?" (captured)":"");
+    LOG_INFO("Position: (%.0f,%.0f), %d outputs%s", est_x, est_y, num_outputs,
+             cursor_captured ? " (captured)" : " (primary output center)");
 
     setup_control_socket(socket_path);
     start_time_ms = get_time_ms();
