@@ -9,12 +9,12 @@ A beautiful, meteor-like mouse cursor trail overlay for Wayland compositors (nir
 > ⚠️ **重要警告 / Important Warning**
 >
 > 本项目使用**靶状输入区域**（屏幕中央的十字形微小区域）来检测显示器跳转。
-> 该区域虽然仅约 900 px²（不到屏幕的 0.07%），但在**全屏游戏中可能导致屏幕中央的鼠标点击失灵**（如 FPS 射击、MOBA 等需要频繁点击中央区域的游戏）。
+> 该区域虽然仅约 864 px²（不到屏幕的 0.07%），但在**全屏游戏中可能导致屏幕中央的鼠标点击失灵**（如 FPS 射击、MOBA 等需要频繁点击中央区域的游戏）。
 >
 > **请在进入游戏前运行 `mouse-trail-toggle` 关闭拖尾，游戏结束后再次运行开启。**
 >
 > This project uses a **bullseye input region** (a tiny cross-shaped area at screen center) for monitor-switch detection.
-> While only ~900 px² (<0.07% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
+> While only ~864 px² (<0.07% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
 >
 > **Run `mouse-trail-toggle` to disable the trail before gaming, and again to re-enable after.**
 
@@ -107,18 +107,11 @@ mouse-trail-ctl color-cycle on      # Enable HSL rainbow cycling
 mouse-trail-ctl color-cycle off     # Disable
 mouse-trail-ctl show                # Show trail
 mouse-trail-ctl hide                # Hide trail
-mouse-trail-ctl warp                # Trigger full-screen recapture (bind to monitor-switch hotkey)
+mouse-trail-ctl warp                # Trigger full-screen recapture
 mouse-trail-ctl help                # Show all commands with defaults
 ```
 
-**Recommended niri hotkey binding for reliable monitor-switch tracking:**
-
-```kdl
-Mod+Shift+Left  { focus-monitor-left;  spawn-sh "mouse-trail-ctl warp"; }
-Mod+Shift+Right { focus-monitor-right; spawn-sh "mouse-trail-ctl warp"; }
-```
-
-This ensures the trail instantly recalibrates when switching monitors via keyboard.
+> **Monitor-switch tracking is automatic.** The program monitors keyboard events (Super+Shift+Left/Right, Super+Shift+Ctrl+Left/Right) and automatically restarts with full calibration on screen switches. No extra hotkey binding needed.
 
 ### CLI options
 
@@ -128,6 +121,7 @@ mouse-trail --help
 Options:
   --config PATH       Config file (default: ~/.config/mouse-trail/config)
   --device PATH       Input device (default: /dev/input/event2)
+  --kbd-device PATH    Keyboard for hotkey detection (default: /dev/input/event5)
   --color RRGGBB      Trail color (default: ffffff)
   --alpha N           Opacity 0-1 (default: 1.0)
   --width N           Head radius in px (default: 8)
@@ -159,6 +153,7 @@ smooth_factor=0.6
 color_cycle=off
 cycle_speed=5
 device=/dev/input/event2
+kbd_device=/dev/input/event5
 import=/path/to/theme.conf
 ```
 
@@ -228,7 +223,7 @@ After the initial 5-second calibration window, the input region shrinks to a **b
                           ↓  2×200 vertical arm
 ```
 
-Only the cross-shaped lines (10×10 center square + horizontal/vertical arms) receive pointer events. The rest of the screen has full click passthrough.
+Only the cross-shaped lines (2×10 ring center + horizontal/vertical arms) receive pointer events. The rest of the screen has full click passthrough.
 
 - **2×10 ring center** (64 px²): 2px-thick hollow square catches cursor at warp target without blocking the exact center
 - **Horizontal arm** 200×2 (400 px²): catches cursor moving left/right from center
@@ -245,6 +240,7 @@ Only the cross-shaped lines (10×10 center square + horizontal/vertical arms) re
 
 ```
 /dev/input/event2 ──► Input Thread (libevdev, per-event clamping)
+/dev/input/event5 ──► Keyboard Thread (hotkey detection)
                            │
                      trail.pos_x, trail.pos_y
                      trail ring buffer (absolute global coords)
@@ -254,7 +250,7 @@ Only the cross-shaped lines (10×10 center square + horizontal/vertical arms) re
         │
         ▼
    wlr-layer-shell overlay (one surface per wl_output)
-   (input_region = empty → click passthrough)
+   (input_region = bullseye → near-full passthrough)
 ```
 
 ### Key design decisions
@@ -276,7 +272,9 @@ mouse-trail/
 │   ├── xdg-shell-client-protocol.c        # Pre-generated xdg-shell (dependency)
 │   └── relative-pointer-client-protocol.h/c # Generated (unused, kept for reference)
 ├── mouse-trail.nix                        # Nix home-manager module
+├── config.example                         # Example configuration
 ├── Makefile                               # Manual gcc compilation
+├── README.md / README.zh-CN.md            # Documentation
 └── test-mouse-trail.sh                    # Log-based verification script
 ```
 

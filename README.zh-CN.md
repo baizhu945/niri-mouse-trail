@@ -7,12 +7,12 @@
 > ⚠️ **重要警告 / Important Warning**
 >
 > 本项目使用**靶状输入区域**（屏幕中央的十字形微小区域）来检测显示器跳转。
-> 该区域虽然仅约 900 px²（不到屏幕的 0.07%），但在**全屏游戏中可能导致屏幕中央的鼠标点击失灵**（如 FPS 射击、MOBA 等需要频繁点击中央区域的游戏）。
+> 该区域虽然仅约 864 px²（不到屏幕的 0.07%），但在**全屏游戏中可能导致屏幕中央的鼠标点击失灵**（如 FPS 射击、MOBA 等需要频繁点击中央区域的游戏）。
 >
 > **请在进入游戏前运行 `mouse-trail-toggle` 关闭拖尾，游戏结束后再次运行开启。**
 >
 > This project uses a **bullseye input region** (a tiny cross-shaped area at screen center) for monitor-switch detection.
-> While only ~900 px² (<0.07% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
+> While only ~864 px² (<0.07% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
 >
 > **Run `mouse-trail-toggle` to disable the trail before gaming, and again to re-enable after.**
 
@@ -105,16 +105,11 @@ mouse-trail-ctl color-cycle on      # 开启 HSL 彩虹循环
 mouse-trail-ctl color-cycle off     # 关闭
 mouse-trail-ctl show                # 显示拖尾
 mouse-trail-ctl hide                # 隐藏拖尾
-mouse-trail-ctl warp                # 触发全屏重捕获（绑定到跳屏快捷键）
+mouse-trail-ctl warp                # 触发全屏重捕获
 mouse-trail-ctl help                # 显示所有命令及默认值
 ```
 
-**推荐的 niri 跳屏快捷键绑定（确保跳屏时拖尾即时跟随）：**
-
-```kdl
-Mod+Shift+Left  { focus-monitor-left;  spawn-sh "mouse-trail-ctl warp"; }
-Mod+Shift+Right { focus-monitor-right; spawn-sh "mouse-trail-ctl warp"; }
-```
+> **跳屏追踪是全自动的。** 程序会监听键盘事件（Super+Shift+Left/Right、Super+Shift+Ctrl+Left/Right），在屏幕切换时自动重启并进行全表面校准，无需额外绑定快捷键。
 
 ### 命令行选项
 
@@ -124,6 +119,7 @@ mouse-trail --help
 选项：
   --config PATH       配置文件路径（默认：~/.config/mouse-trail/config）
   --device PATH       输入设备（默认：/dev/input/event2）
+  --kbd-device PATH    键盘设备，用于快捷键检测（默认：/dev/input/event5）
   --color RRGGBB      拖尾颜色（默认：ffffff）
   --alpha N           透明度 0-1（默认：1.0）
   --width N           头部半径（像素，默认：8）
@@ -155,6 +151,7 @@ smooth_factor=0.6
 color_cycle=off
 cycle_speed=5
 device=/dev/input/event2
+kbd_device=/dev/input/event5
 import=/path/to/theme.conf
 ```
 
