@@ -36,6 +36,7 @@ typedef struct {
     int phys_w, phys_h;      /* physical pixel dimensions from mode */
     double scale;
     int configured;
+    int removed;            /* marked when compositor removes this output */
 } output_t;
 
 static struct wl_display *display = NULL;
@@ -193,7 +194,17 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
         if (!seat) { seat = wl_registry_bind(reg, name, &wl_seat_interface, 5); pointer = wl_seat_get_pointer(seat); }
     }
 }
-static void registry_global_remove(void *data, struct wl_registry *reg, uint32_t name) { (void)data;(void)reg;(void)name; }
+static void registry_global_remove(void *data, struct wl_registry *reg, uint32_t name) {
+    (void)data;(void)reg;
+    for (int i = 0; i < num_outputs; i++) {
+        if (outputs[i].wl_output && 
+            wl_proxy_get_id((struct wl_proxy *)outputs[i].wl_output) == name) {
+            outputs[i].removed = 1;
+            LOG_INFO("Output %d removed", i);
+            return;
+        }
+    }
+}
 static const struct wl_registry_listener registry_listener = { .global=registry_global, .global_remove=registry_global_remove };
 
 static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *s,
@@ -209,7 +220,19 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *s,
             return;
         }
 }
-static void layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *s) { (void)data; zwlr_layer_surface_v1_destroy(s); running=0; }
+static void layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *s) {
+    (void)data;
+    for (int i = 0; i < num_outputs; i++) {
+        if (outputs[i].layer_surface == s) {
+            outputs[i].removed = 1;
+            outputs[i].layer_surface = NULL;
+            outputs[i].configured = 0;
+            LOG_INFO("Layer surface %d closed by compositor", i);
+            return;
+        }
+    }
+    zwlr_layer_surface_v1_destroy(s);
+}
 static const struct zwlr_layer_surface_v1_listener layer_surface_listener = { .configure=layer_surface_configure, .closed=layer_surface_closed };
 
 static struct wl_buffer *create_shm_buffer(int w, int h, void **data_out, int *stride_out) {
@@ -234,7 +257,7 @@ static void draw_trail_point(void *user, double x, double y, double radius,
 }
 
 static void render_output(output_t *out) {
-    if (out->width <= 0 || out->height <= 0 || !out->configured) return;
+    if (out->removed || out->width <= 0 || out->height <= 0 || !out->configured) return;
     void *data; int stride;
     struct wl_buffer *buf = create_shm_buffer(out->width, out->height, &data, &stride);
     if (!buf) return;
@@ -617,6 +640,7 @@ int main(int argc, char *argv[]) {
         /* Transition to bullseye: cursor captured, OR startup timeout (5s) */
         if (!center_region_set && (cursor_captured || get_time_ms() - start_time_ms > 5000)) {
             for(int i=0;i<num_outputs;i++){
+                if (outputs[i].removed) continue;
                 struct wl_region *r = wl_compositor_create_region(compositor);
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
                 /* Bullseye: 2x10 ring center + cross arms */
