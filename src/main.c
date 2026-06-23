@@ -20,7 +20,6 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
-#include <unistd.h>
 #include <linux/input.h>
 
 FILE *g_log_file = NULL;
@@ -69,7 +68,6 @@ static int timer_fd = -1;
 static int running = 1;
 static int need_redraw = 0;
 static int center_region_set = 0;
-static int warp_recapture = 0;
 
 static int color_cycle_on = 0;
 static double cycle_speed = 5.0;
@@ -433,7 +431,7 @@ static void usage(const char *p) {
         "Usage: %s [OPTIONS]\n"
         "  --config PATH       Config file (default: ~/.config/mouse-trail/config)\n"
         "  --device PATH       Input device (default: /dev/input/event2)\n"
-        "  --kbd-device PATH    Keyboard for hotkey detection (default: /dev/input/event3)\n"
+        "  --kbd-device PATH    Keyboard for hotkey detection (default: /dev/input/event5)\n"
         "  --color RRGGBB     Trail color (default: ffffff)\n  --alpha N       Opacity 0-1\n"
         "  --width N           Head radius px\n  --length N    Duration ms\n"
         "  --min-speed N       Stationary threshold px\n  --smooth-factor N EMA 0-1\n"
@@ -621,8 +619,7 @@ int main(int argc, char *argv[]) {
 
     while (running) {
         /* Transition to bullseye: cursor captured, OR startup timeout (5s) */
-        if (!center_region_set && (cursor_captured ||
-            (!warp_recapture && get_time_ms() - start_time_ms > 5000))) {
+        if (!center_region_set && (cursor_captured || get_time_ms() - start_time_ms > 5000)) {
             for(int i=0;i<num_outputs;i++){
                 struct wl_region *r = wl_compositor_create_region(compositor);
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
@@ -635,7 +632,6 @@ int main(int argc, char *argv[]) {
                 wl_surface_commit(outputs[i].surface);
             }
             center_region_set = 1;
-            warp_recapture = 0;
             LOG_INFO("Bullseye region active (10x10 center + cross)");
         }
 
