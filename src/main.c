@@ -225,9 +225,10 @@ static void layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *s) {
     for (int i = 0; i < num_outputs; i++) {
         if (outputs[i].layer_surface == s) {
             outputs[i].removed = 1;
-            outputs[i].layer_surface = NULL;
             outputs[i].configured = 0;
-            LOG_INFO("Layer surface %d closed by compositor", i);
+            zwlr_layer_surface_v1_destroy(s);
+            outputs[i].layer_surface = NULL;
+            LOG_INFO("Layer surface %d closed, destroyed", i);
             return;
         }
     }
@@ -692,6 +693,7 @@ int main(int argc, char *argv[]) {
     }
 
     LOG_INFO("Shutting down");
+    wl_display_roundtrip(display);
     pthread_cancel(input_thread); pthread_join(input_thread, NULL);
     if (kbd_evdev) { pthread_cancel(kbd_thread); pthread_join(kbd_thread, NULL); }
     for(int i=0;i<num_outputs;i++){ if(outputs[i].layer_surface)zwlr_layer_surface_v1_destroy(outputs[i].layer_surface); if(outputs[i].surface)wl_surface_destroy(outputs[i].surface); if(outputs[i].wl_output)wl_output_destroy(outputs[i].wl_output); }
