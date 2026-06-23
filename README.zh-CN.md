@@ -4,6 +4,18 @@
 
 [English](README.md)
 
+> ⚠️ **重要警告 / Important Warning**
+>
+> 本项目使用**靶状输入区域**（屏幕中央的十字形微小区域）来检测显示器跳转。
+> 该区域虽然仅约 900 px²（不到屏幕的 0.07%），但在**全屏游戏中可能导致屏幕中央的鼠标点击失灵**（如 FPS 射击、MOBA 等需要频繁点击中央区域的游戏）。
+>
+> **请在进入游戏前运行 `mouse-trail-toggle` 关闭拖尾，游戏结束后再次运行开启。**
+>
+> This project uses a **bullseye input region** (a tiny cross-shaped area at screen center) for monitor-switch detection.
+> While only ~900 px² (<0.07% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
+>
+> **Run `mouse-trail-toggle` to disable the trail before gaming, and again to re-enable after.**
+
 ---
 
 ## 关于本项目
