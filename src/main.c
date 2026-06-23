@@ -486,7 +486,7 @@ int main(int argc, char *argv[]) {
     parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms, &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed);
 
     /* Default keyboard device for hotkey detection */
-    if (!kbd_device_path) kbd_device_path = "/dev/input/event3";
+    if (!kbd_device_path) kbd_device_path = "/dev/input/event5";
 
     if (log_path && strcmp(log_path,"-")!=0 && ctl_cmd==NULL) { FILE *f=fopen(log_path,"a"); if(f)log_init(f,log_level); else{log_init(stderr,log_level);LOG_ERROR("Cannot open: %s",log_path);} }
     else log_init(stderr, log_level);
