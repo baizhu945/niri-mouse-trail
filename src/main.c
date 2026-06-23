@@ -267,6 +267,13 @@ static void handle_control_msg(const char *msg) {
     else if (strncmp(msg,"alpha ",6)==0) { trail.a=atof(msg+6); need_redraw=1; }
     else if (strcmp(msg,"show")==0) { trail.visible=true; need_redraw=1; }
     else if (strcmp(msg,"hide")==0) { trail.visible=false; need_redraw=1; }
+    else if (strcmp(msg,"warp")==0) {
+        /* Trigger full-surface recapture: reset flags + timer */
+        center_region_set = 0;
+        cursor_captured = 0;
+        start_time_ms = get_time_ms();  /* restart 5s timeout for this recapture */
+        LOG_INFO("Warp: expanding to full region, waiting for cursor");
+    }
 }
 
 static void setup_control_socket(const char *path) {

@@ -95,8 +95,18 @@ mouse-trail-ctl color-cycle on      # Enable HSL rainbow cycling
 mouse-trail-ctl color-cycle off     # Disable
 mouse-trail-ctl show                # Show trail
 mouse-trail-ctl hide                # Hide trail
+mouse-trail-ctl warp                # Trigger full-screen recapture (bind to monitor-switch hotkey)
 mouse-trail-ctl help                # Show all commands with defaults
 ```
+
+**Recommended niri hotkey binding for reliable monitor-switch tracking:**
+
+```kdl
+Mod+Shift+Left  { focus-monitor-left;  spawn-sh "mouse-trail-ctl warp"; }
+Mod+Shift+Right { focus-monitor-right; spawn-sh "mouse-trail-ctl warp"; }
+```
+
+This ensures the trail instantly recalibrates when switching monitors via keyboard.
 
 ### CLI options
 
@@ -215,7 +225,7 @@ Only the cross-shaped lines (10×10 center square + horizontal/vertical arms) re
 
 **Why this design?** When niri warps the cursor to another monitor, the cursor lands at the output center. If the cursor is hidden (niri's `hide-after-inactive-ms`), the compositor may delay sending `wl_pointer.enter` events. The bullseye arms catch the cursor as it moves away from center in any direction, providing a second chance at calibration. The minimal area ensures everyday clicks are virtually never blocked.
 
-**Why 5-second full surface at startup?** The initial full-surface window guarantees the cursor position is captured immediately when the trail is first enabled, even if the cursor is stationary. After capture, the bullseye handles subsequent warps.
+### Why 5-second full surface at startup? The initial full-surface window guarantees the cursor position is captured immediately when the trail is first enabled, even if the cursor is stationary. After capture, the bullseye handles subsequent warps.
 
 ---
 

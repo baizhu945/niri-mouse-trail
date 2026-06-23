@@ -93,7 +93,15 @@ mouse-trail-ctl color-cycle on      # 开启 HSL 彩虹循环
 mouse-trail-ctl color-cycle off     # 关闭
 mouse-trail-ctl show                # 显示拖尾
 mouse-trail-ctl hide                # 隐藏拖尾
+mouse-trail-ctl warp                # 触发全屏重捕获（绑定到跳屏快捷键）
 mouse-trail-ctl help                # 显示所有命令及默认值
+```
+
+**推荐的 niri 跳屏快捷键绑定（确保跳屏时拖尾即时跟随）：**
+
+```kdl
+Mod+Shift+Left  { focus-monitor-left;  spawn-sh "mouse-trail-ctl warp"; }
+Mod+Shift+Right { focus-monitor-right; spawn-sh "mouse-trail-ctl warp"; }
 ```
 
 ### 命令行选项

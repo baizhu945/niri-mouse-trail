@@ -80,6 +80,7 @@ let
         echo "  speed N           Set trail duration in ms (default: 500)"
         echo "  color-cycle on|off  Enable/disable color cycling (default: off)"
         echo "  show / hide       Show or hide trail"
+        echo "  warp              Trigger full-screen recapture (for monitor switch)"
         echo "  help              Show this help"
         exit 0
     fi
