@@ -1,13 +1,38 @@
 # Mouse Trail Configuration
+# Copy this file to ~/.config/mouse-trail/config
 # Lines starting with # are comments
 # Use import=path to include another config file
 
-color=#80c8ff
-alpha=0.5
-width=6
-length=400
+# Trail color (hex, with or without #)
+color=80c8ff
+
+# Trail opacity (0-1)
+alpha=1.0
+
+# Head radius in pixels
+width=8
+
+# Trail duration in milliseconds
+length=500
+
+# Stationary detection threshold in pixels
 min_speed=2
+
+# EMA smoothing factor (0-1, higher = smoother)
 smooth_factor=0.6
+
+# Auto color cycling (HSL rainbow)
 color_cycle=off
+
+# Color cycle period in seconds
 cycle_speed=5
+
+# Mouse input device
 device=/dev/input/event2
+
+# Keyboard device for hotkey-based warp detection
+# (Super+Shift+Left/Right, Super+Shift+Ctrl+Left/Right)
+kbd_device=/dev/input/event5
+
+# Import another config file
+#import=/path/to/theme.conf

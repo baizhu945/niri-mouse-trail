@@ -383,7 +383,8 @@ static int config_include_count = 0;
 static void parse_config(const char *path,
     double *cr, double *cg, double *cb, double *ca,
     double *width, uint64_t *length_ms, double *min_speed, double *smooth_factor,
-    int *color_cycle_on, double *cycle_speed) {
+    int *color_cycle_on, double *cycle_speed,
+    const char **device, const char **kbd_device) {
     if (config_include_count >= MAX_CONFIG_INCLUDES) return;
     config_include_count++;
     FILE *f = fopen(path, "r");
@@ -401,7 +402,7 @@ static void parse_config(const char *path,
         while (*key && (key[strlen(key)-1]==' '||key[strlen(key)-1]=='\t')) key[strlen(key)-1]='\0';
         while (*val == ' ' || *val == '\t') val++;
 
-        if (strcmp(key, "import") == 0) { parse_config(val, cr, cg, cb, ca, width, length_ms, min_speed, smooth_factor, color_cycle_on, cycle_speed); }
+        if (strcmp(key, "import") == 0) { parse_config(val, cr, cg, cb, ca, width, length_ms, min_speed, smooth_factor, color_cycle_on, cycle_speed, device, kbd_device); }
         else if (strcmp(key, "color") == 0) { unsigned int ri,gi,bi; const char *cv = val; if (*cv=='#') cv++; if(sscanf(cv,"%02x%02x%02x",&ri,&gi,&bi)==3){ *cr=ri/255.0;*cg=gi/255.0;*cb=bi/255.0; } }
         else if (strcmp(key, "alpha") == 0) *ca = atof(val);
         else if (strcmp(key, "width") == 0) *width = atof(val);
@@ -410,8 +411,8 @@ static void parse_config(const char *path,
         else if (strcmp(key, "smooth_factor") == 0) *smooth_factor = atof(val);
         else if (strcmp(key, "color_cycle") == 0) *color_cycle_on = (strcmp(val, "on") == 0);
         else if (strcmp(key, "cycle_speed") == 0) *cycle_speed = atof(val);
-        else if (strcmp(key, "device") == 0) { /* device_path handled externally */ }
-        else if (strcmp(key, "kbd_device") == 0) { /* kbd_device_path handled externally */ }
+        else if (strcmp(key, "device") == 0) { *device = strdup(val); }
+        else if (strcmp(key, "kbd_device") == 0) { *kbd_device = strdup(val); }
     }
     fclose(f);
 }
@@ -483,7 +484,7 @@ int main(int argc, char *argv[]) {
         else snprintf(def_cfg, sizeof(def_cfg), "/tmp/mouse-trail-config");
         config_path = def_cfg;
     }
-    parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms, &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed);
+    parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms, &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed, &device_path, &kbd_device_path);
 
     /* Default keyboard device for hotkey detection */
     if (!kbd_device_path) kbd_device_path = "/dev/input/event5";
