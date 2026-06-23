@@ -623,16 +623,19 @@ int main(int argc, char *argv[]) {
             for(int i=0;i<num_outputs;i++){
                 struct wl_region *r = wl_compositor_create_region(compositor);
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-                /* Bullseye: 10x10 center + cross arms */
-                wl_region_add(r, cx - 5,  cy - 5,  10, 10);
-                wl_region_add(r, cx - 100, cy - 1,  200, 2);
-                wl_region_add(r, cx - 1,  cy - 100, 2,  200);
+                /* Bullseye: 2x10 ring center + cross arms */
+                wl_region_add(r, cx - 5,  cy - 5,  10, 2);   /* top ring */
+                wl_region_add(r, cx - 5,  cy + 3,  10, 2);   /* bottom ring */
+                wl_region_add(r, cx - 5,  cy - 3,  2,  6);   /* left ring */
+                wl_region_add(r, cx + 3,  cy - 3,  2,  6);   /* right ring */
+                wl_region_add(r, cx - 100, cy - 1,  200, 2);  /* horizontal */
+                wl_region_add(r, cx - 1,  cy - 100, 2,  200); /* vertical */
                 wl_surface_set_input_region(outputs[i].surface, r);
                 wl_region_destroy(r);
                 wl_surface_commit(outputs[i].surface);
             }
             center_region_set = 1;
-            LOG_INFO("Bullseye region active (10x10 center + cross)");
+            LOG_INFO("Bullseye region active (2x10 ring + cross)");
         }
 
         while (wl_display_prepare_read(display)!=0) wl_display_dispatch_pending(display);
