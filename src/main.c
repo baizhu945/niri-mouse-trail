@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <linux/input.h>
 
 FILE *g_log_file = NULL;
@@ -271,10 +272,14 @@ static void handle_control_msg(const char *msg) {
     else if (strcmp(msg,"show")==0) { trail.visible=true; need_redraw=1; }
     else if (strcmp(msg,"hide")==0) { trail.visible=false; need_redraw=1; }
     else if (strcmp(msg,"warp")==0) {
-        center_region_set = 0;
-        cursor_captured = 0;
-        warp_recapture = 1;
-        LOG_INFO("Warp: expanding to full region, waiting for cursor");
+        LOG_INFO("Warp command: restarting trail");
+        if (fork() == 0) {
+            sleep(1);
+            execlp("mouse-trail-toggle", "mouse-trail-toggle", NULL);
+            execlp("mouse-trail", "mouse-trail", NULL);
+            _exit(1);
+        }
+        running = 0;
     }
 }
 
@@ -351,15 +356,18 @@ static void *kbd_thread_fn(void *arg) {
                     if (pressed && super_down && shift_down &&
                         get_time_ms() - last_warp_trigger > 1000) {
                         last_warp_trigger = get_time_ms();
-                        LOG_INFO("Warp hotkey detected (Super+Shift+%s%s), triggering recalibration",
+                        LOG_INFO("Warp hotkey detected (Super+Shift+%s%s), restarting trail",
                                  ev.code == KEY_LEFT ? "Left" : "Right",
                                  ctrl_down ? "+Ctrl" : "");
-                        pthread_mutex_lock(&input_mutex);
-                        center_region_set = 0;
-                        cursor_captured = 0;
-                        warp_recapture = 1;
-                        need_redraw = 1;
-                        pthread_mutex_unlock(&input_mutex);
+                        /* Fork child to restart after parent exits */
+                        if (fork() == 0) {
+                            sleep(1);  /* wait for parent to shutdown */
+                            execlp("mouse-trail-toggle", "mouse-trail-toggle", NULL);
+                            /* Fallback: try direct restart */
+                            execlp("mouse-trail", "mouse-trail", NULL);
+                            _exit(1);
+                        }
+                        running = 0;
                     }
                     break;
             }
