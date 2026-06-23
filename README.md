@@ -8,13 +8,13 @@ A beautiful, meteor-like mouse cursor trail overlay for Wayland compositors (nir
 
 > ⚠️ **重要警告 / Important Warning**
 >
-> 本项目使用**十字形校准区域**（屏幕中央的十字形微小线条）来定期校正光标位置。
-> 该区域虽然仅约 800 px²（不到屏幕的 0.06%），但在**全屏游戏中可能导致屏幕中央的鼠标点击失灵**（如 FPS 射击、MOBA 等需要频繁点击中央区域的游戏）。
+> 本项目使用**环形校准区域**（屏幕中央的 2px 细环）来定期校正光标位置。
+> 该区域虽然仅约 1592 px²（不到屏幕的 0.12%），但在**全屏游戏中可能导致屏幕中央的鼠标点击失灵**（如 FPS 射击、MOBA 等需要频繁点击中央区域的游戏）。
 >
 > **请在进入游戏前运行 `mouse-trail-toggle` 关闭拖尾，游戏结束后再次运行开启。**
 >
-> This project uses a **cross-shaped calibration region** (tiny crosshair lines at screen center) for periodic cursor position correction.
-> While only ~800 px² (<0.06% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
+> This project uses a **ring-shaped calibration region** (a 2px-thin hollow square at screen center) for periodic cursor position correction.
+> While only ~1592 px² (<0.12% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
 >
 > **Run `mouse-trail-toggle` to disable the trail before gaming, and again to re-enable after.**
 
@@ -200,34 +200,37 @@ Wayland intentionally prevents clients from querying the global cursor position.
 
 This is the best achievable solution within Wayland's security constraints — we cannot query the cursor position directly, so we combine evdev tracking with opportunistic compositor calibration.
 
-### Cross Calibration Region
+### Ring Calibration Region
 
-After the initial 5-second calibration window, the input region shrinks to a **cross-shaped pattern** at each output's center:
+After the initial 5-second calibration window, the input region shrinks to a **hollow ring** (200×200 outer, 196×196 inner, 2px line thickness) at each output's center:
 
 ```
-                          ↑
-                          │  2×200 vertical line
-                          │
-                          │
-                          │
-═══════════════════════════╪═══════════════════════════
-      200×2 horizontal →  │  ← 200×2 horizontal line
-═══════════════════════════╪═══════════════════════════
-                          │
-                          │
-                          │
-                          ↓  2×200 vertical line
+    ┌───────────────────────────────────────┐
+    │                                       │
+    │         ███████████████████████        │
+    │         ██                     ██      │
+    │         ██                     ██      │
+    │         ██     open center     ██      │
+    │         ██    (196×196 px)     ██      │
+    │         ██   full passthrough  ██      │
+    │         ██                     ██      │
+    │         ██                     ██      │
+    │         ███████████████████████        │
+    │        ↑ 200×200 outer, 2px thick ↑   │
+    │                                       │
+    └───────────────────────────────────────┘
 ```
 
-Only the two thin crosshair lines receive pointer events. The rest of the screen has full click passthrough.
+Only the 2px-thin hollow square receives pointer events. Everything inside and outside has full click passthrough.
 
-- **Horizontal line** 200×2 (400 px²)
-- **Vertical line** 2×200 (400 px²)
-- **Total area**: ~800 px² — less than 0.06% of a 1440×900 surface
+- **Outer dimensions**: 200×200 px
+- **Line thickness**: 2 px
+- **Inner open area**: 196×196 px (center is completely free)
+- **Total active area**: ~1592 px² — less than 0.12% of a 1440×900 surface
 
-**Why calibration?** The trail tracks cursor position by integrating velocity from raw evdev events (speed → position). Digital integration inherently accumulates floating-point error over time. When the cursor crosses the calibration crosshair, `wl_pointer` provides an absolute position ground-truth from the compositor, instantly correcting any accumulated drift.
+**Why a ring?** A closed loop guarantees calibration: to leave the center area in ANY direction, the cursor MUST cross the ring. Unlike a cross pattern, there are no "gaps" to slip through. The center 196×196 area is completely open — UI elements placed at screen center are never blocked.
 
-**Why not a full-time full-surface?** Wayland's security model prevents us from simultaneously receiving pointer events (needed for absolute position) and passing clicks through (needed for usability). The crosshair gives us near-full passthrough with just enough surface coverage to periodically catch the cursor for recalibration.
+**Why calibration?** The trail tracks cursor position by integrating velocity from raw evdev events (speed → position). Digital integration inherently accumulates floating-point error over time. When the cursor crosses the ring, `wl_pointer` provides an absolute position ground-truth from the compositor, instantly correcting any accumulated drift.
 
 **Monitor-switch detection** is handled separately by monitoring keyboard hotkeys (Super+Shift+Left/Right). A detected screen switch triggers an automatic restart with full-surface calibration.
 

@@ -644,15 +644,17 @@ int main(int argc, char *argv[]) {
                 if (outputs[i].removed) continue;
                 struct wl_region *r = wl_compositor_create_region(compositor);
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-                /* Cross-shaped calibration region */
-                wl_region_add(r, cx - 100, cy - 1,  200, 2);  /* horizontal */
-                wl_region_add(r, cx - 1,  cy - 100, 2,  200); /* vertical */
+                /* Closed ring: 200x200 hollow square, 2px thick */
+                wl_region_add(r, cx - 100, cy - 101, 200, 2);   /* top */
+                wl_region_add(r, cx - 100, cy + 99,  200, 2);   /* bottom */
+                wl_region_add(r, cx - 101, cy - 99,  2,   198); /* left */
+                wl_region_add(r, cx + 99,  cy - 99,  2,   198); /* right */
                 wl_surface_set_input_region(outputs[i].surface, r);
                 wl_region_destroy(r);
                 wl_surface_commit(outputs[i].surface);
             }
             center_region_set = 1;
-            LOG_INFO("Cross calibration region active (200x2 arms)");
+            LOG_INFO("Ring calibration region active (200x200 hollow, 2px)");
         }
 
         while (wl_display_prepare_read(display)!=0) wl_display_dispatch_pending(display);
