@@ -7,13 +7,13 @@
 color=80c8ff
 
 # Trail opacity (0-1)
-alpha=1.0
+alpha=0.6
 
 # Head radius in pixels
-width=8
+width=6
 
 # Trail duration in milliseconds
-length=500
+length=400
 
 # Stationary detection threshold in pixels
 min_speed=2
