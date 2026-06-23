@@ -68,6 +68,7 @@ static int timer_fd = -1;
 static int running = 1;
 static int need_redraw = 0;
 static int center_region_set = 0;
+static int warp_recapture = 0;
 
 static int color_cycle_on = 0;
 static double cycle_speed = 5.0;
@@ -270,10 +271,9 @@ static void handle_control_msg(const char *msg) {
     else if (strcmp(msg,"show")==0) { trail.visible=true; need_redraw=1; }
     else if (strcmp(msg,"hide")==0) { trail.visible=false; need_redraw=1; }
     else if (strcmp(msg,"warp")==0) {
-        /* Trigger full-surface recapture: reset flags + timer */
         center_region_set = 0;
         cursor_captured = 0;
-        start_time_ms = get_time_ms();  /* restart 5s timeout for this recapture */
+        warp_recapture = 1;
         LOG_INFO("Warp: expanding to full region, waiting for cursor");
     }
 }
@@ -357,7 +357,7 @@ static void *kbd_thread_fn(void *arg) {
                         pthread_mutex_lock(&input_mutex);
                         center_region_set = 0;
                         cursor_captured = 0;
-                        start_time_ms = get_time_ms();
+                        warp_recapture = 1;
                         need_redraw = 1;
                         pthread_mutex_unlock(&input_mutex);
                     }
@@ -612,19 +612,24 @@ int main(int argc, char *argv[]) {
     LOG_INFO("Main loop");
 
     while (running) {
-        /* After cursor captured or 5s, shrink to center region */
-        if (!center_region_set && (cursor_captured || get_time_ms() - start_time_ms > 5000)) {
+        /* Transition to bullseye: cursor captured, OR startup timeout (5s) */
+        if (!center_region_set && (cursor_captured ||
+            (!warp_recapture && get_time_ms() - start_time_ms > 5000))) {
             for(int i=0;i<num_outputs;i++){
                 struct wl_region *r = wl_compositor_create_region(compositor);
                 int cx = outputs[i].width / 2, cy = outputs[i].height / 2;
-                /* Bullseye: 10x10 center + cross arms (60px each way) */
-                wl_region_add(r, cx - 5,  cy - 5,  10, 10);  /* center */
-                wl_region_add(r, cx - 100, cy - 1,  200, 2); /* horizontal */
-                wl_region_add(r, cx - 1,  cy - 100, 2,  200); /* vertical */
+                /* Bullseye: 10x10 center + cross arms */
+                wl_region_add(r, cx - 5,  cy - 5,  10, 10);
+                wl_region_add(r, cx - 100, cy - 1,  200, 2);
+                wl_region_add(r, cx - 1,  cy - 100, 2,  200);
                 wl_surface_set_input_region(outputs[i].surface, r);
                 wl_region_destroy(r);
                 wl_surface_commit(outputs[i].surface);
             }
+            center_region_set = 1;
+            warp_recapture = 0;
+            LOG_INFO("Bullseye region active (10x10 center + cross)");
+        }
             center_region_set = 1;
             LOG_INFO("Bullseye region active (10x10 center + cross)");
         }
