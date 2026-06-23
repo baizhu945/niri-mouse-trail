@@ -58,7 +58,9 @@ static uint64_t start_time_ms = 0;
 
 static struct libevdev *evdev = NULL;
 static int input_fd = -1;
-static pthread_t input_thread;
+static struct libevdev *kbd_evdev = NULL;
+static int kbd_fd = -1;
+static pthread_t input_thread, kbd_thread;
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int ctrl_fd = -1;
@@ -325,6 +327,45 @@ static void *input_thread_fn(void *arg) {
     return NULL;
 }
 
+/* Keyboard monitor: detect monitor-switch hotkeys and trigger warp */
+static void *kbd_thread_fn(void *arg) {
+    (void)arg;
+    if (!kbd_evdev) return NULL;
+    int super_down = 0, shift_down = 0, ctrl_down = 0;
+    struct input_event ev;
+    while (running) {
+        int rc = libevdev_next_event(kbd_evdev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_KEY) {
+            int pressed = (ev.value == 1);
+            int released = (ev.value == 0);
+            switch (ev.code) {
+                case KEY_LEFTMETA: case KEY_RIGHTMETA:
+                    if (pressed) super_down = 1; else if (released) super_down = 0; break;
+                case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT:
+                    if (pressed) shift_down = 1; else if (released) shift_down = 0; break;
+                case KEY_LEFTCTRL: case KEY_RIGHTCTRL:
+                    if (pressed) ctrl_down = 1; else if (released) ctrl_down = 0; break;
+                case KEY_LEFT:
+                case KEY_RIGHT:
+                    if (pressed && super_down && shift_down) {
+                        LOG_INFO("Warp hotkey detected (Super+Shift+%s%s), triggering recalibration",
+                                 ev.code == KEY_LEFT ? "Left" : "Right",
+                                 ctrl_down ? "+Ctrl" : "");
+                        pthread_mutex_lock(&input_mutex);
+                        center_region_set = 0;
+                        cursor_captured = 0;
+                        start_time_ms = get_time_ms();
+                        need_redraw = 1;
+                        pthread_mutex_unlock(&input_mutex);
+                    }
+                    break;
+            }
+        } else if (rc == -EAGAIN) { usleep(500); }
+        else if (rc < 0 && rc != -ENODEV) break;
+    }
+    return NULL;
+}
+
 static int send_control_cmd(const char *sock, const char *cmd) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return 1;
@@ -370,6 +411,7 @@ static void parse_config(const char *path,
         else if (strcmp(key, "color_cycle") == 0) *color_cycle_on = (strcmp(val, "on") == 0);
         else if (strcmp(key, "cycle_speed") == 0) *cycle_speed = atof(val);
         else if (strcmp(key, "device") == 0) { /* device_path handled externally */ }
+        else if (strcmp(key, "kbd_device") == 0) { /* kbd_device_path handled externally */ }
     }
     fclose(f);
 }
@@ -379,6 +421,7 @@ static void usage(const char *p) {
         "Usage: %s [OPTIONS]\n"
         "  --config PATH       Config file (default: ~/.config/mouse-trail/config)\n"
         "  --device PATH       Input device (default: /dev/input/event2)\n"
+        "  --kbd-device PATH    Keyboard for hotkey detection (default: /dev/input/event3)\n"
         "  --color RRGGBB     Trail color (default: ffffff)\n  --alpha N       Opacity 0-1\n"
         "  --width N           Head radius px\n  --length N    Duration ms\n"
         "  --min-speed N       Stationary threshold px\n  --smooth-factor N EMA 0-1\n"
@@ -397,6 +440,7 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
     const char *device_path = "/dev/input/event2";
+    const char *kbd_device_path = NULL;
     double cr=1.0,cg=1.0,cb=1.0,ca=1.0, width=8.0;
     uint64_t length_ms=500; double min_speed=2.0, smooth_factor=0.6;
     int log_level=1; const char *log_path=NULL, *socket_path=NULL, *ctl_cmd=NULL;
@@ -406,6 +450,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i],"--help")==0) { usage(argv[0]); return 0; }
         else if (strcmp(argv[i],"--config")==0&&i+1<argc) config_path=argv[++i];
         else if (strcmp(argv[i],"--device")==0&&i+1<argc) device_path=argv[++i];
+        else if (strcmp(argv[i],"--kbd-device")==0&&i+1<argc) kbd_device_path=argv[++i];
         else if (strcmp(argv[i],"--color")==0&&i+1<argc) {
             const char *c = argv[++i];
             unsigned int ri,gi,bi;
@@ -440,6 +485,9 @@ int main(int argc, char *argv[]) {
     }
     parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms, &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed);
 
+    /* Default keyboard device for hotkey detection */
+    if (!kbd_device_path) kbd_device_path = "/dev/input/event3";
+
     if (log_path && strcmp(log_path,"-")!=0 && ctl_cmd==NULL) { FILE *f=fopen(log_path,"a"); if(f)log_init(f,log_level); else{log_init(stderr,log_level);LOG_ERROR("Cannot open: %s",log_path);} }
     else log_init(stderr, log_level);
 
@@ -453,6 +501,17 @@ int main(int argc, char *argv[]) {
     if (libevdev_new_from_fd(input_fd, &evdev)<0) { LOG_ERROR("libevdev failed"); close(input_fd); return 1; }
 
     trail_init(&trail, width, length_ms, min_speed, smooth_factor, cr, cg, cb, ca);
+
+    /* Open keyboard device for hotkey monitoring */
+    kbd_fd = open(kbd_device_path, O_RDONLY|O_NONBLOCK);
+    if (kbd_fd >= 0 && libevdev_new_from_fd(kbd_fd, &kbd_evdev) >= 0) {
+        LOG_INFO("Keyboard: %s (%s)", libevdev_get_name(kbd_evdev), kbd_device_path);
+    } else {
+        if (kbd_fd >= 0) close(kbd_fd);
+        kbd_fd = -1;
+        kbd_evdev = NULL;
+        LOG_WARN("Cannot open keyboard %s, warp hotkey detection disabled", kbd_device_path);
+    }
 
     display = wl_display_connect(NULL);
     if (!display) { LOG_ERROR("Wayland connect failed"); libevdev_free(evdev); close(input_fd); return 1; }
@@ -533,6 +592,7 @@ int main(int argc, char *argv[]) {
     setup_control_socket(socket_path);
     start_time_ms = get_time_ms();
     pthread_create(&input_thread, NULL, input_thread_fn, NULL);
+    if (kbd_evdev) pthread_create(&kbd_thread, NULL, kbd_thread_fn, NULL);
 
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     struct itimerspec its = {{0,16666667},{0,1}};
@@ -600,11 +660,13 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("Shutting down");
     pthread_cancel(input_thread); pthread_join(input_thread, NULL);
+    if (kbd_evdev) { pthread_cancel(kbd_thread); pthread_join(kbd_thread, NULL); }
     for(int i=0;i<num_outputs;i++){ if(outputs[i].layer_surface)zwlr_layer_surface_v1_destroy(outputs[i].layer_surface); if(outputs[i].surface)wl_surface_destroy(outputs[i].surface); if(outputs[i].wl_output)wl_output_destroy(outputs[i].wl_output); }
     if(pointer)wl_pointer_destroy(pointer); if(seat)wl_seat_destroy(seat);
     if(compositor)wl_compositor_destroy(compositor); if(shm)wl_shm_destroy(shm); if(layer_shell)zwlr_layer_shell_v1_destroy(layer_shell);
     if(registry)wl_registry_destroy(registry); if(display)wl_display_disconnect(display);
     if(evdev)libevdev_free(evdev); if(input_fd>=0)close(input_fd);
+    if(kbd_evdev)libevdev_free(kbd_evdev); if(kbd_fd>=0)close(kbd_fd);
     if(ctrl_fd>=0){close(ctrl_fd);unlink(socket_path);} if(timer_fd>=0)close(timer_fd);
     if(g_log_file&&g_log_file!=stderr)fclose(g_log_file);
     return 0;
