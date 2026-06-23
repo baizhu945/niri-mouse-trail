@@ -536,13 +536,6 @@ int main(int argc, char *argv[]) {
     if (pointer) wl_pointer_add_listener(pointer, &pointer_listener, NULL);
     wl_display_roundtrip(display); /* output geometry/mode/scale */
 
-    double est_x=0,est_y=0;
-    { int mix=0,maxx=0,miy=0,may=0;
-      for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
-        if(o->global_x<mix)mix=o->global_x; if(o->global_x+o->phys_w>maxx)maxx=o->global_x+o->phys_w;
-        if(o->global_y<miy)miy=o->global_y; if(o->global_y+o->phys_h>may)may=o->global_y+o->phys_h; }
-      est_x=(mix+maxx)/2.0; est_y=(miy+may)/2.0; }
-
     for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
         o->surface=wl_compositor_create_surface(compositor);
         o->layer_surface=zwlr_layer_shell_v1_get_layer_surface(layer_shell,o->surface,o->wl_output,ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,"mouse-trail");
@@ -564,6 +557,9 @@ int main(int argc, char *argv[]) {
         if(i==0 || b>bounds_max_y) bounds_max_y=b; }
       LOG_INFO("Bounds: x=[%.0f,%.0f] y=[%.0f,%.0f]",
                bounds_min_x, bounds_max_x, bounds_min_y, bounds_max_y); }
+
+    double est_x = (bounds_min_x + bounds_max_x) / 2.0;
+    double est_y = (bounds_min_y + bounds_max_y) / 2.0;
 
     /* Map surfaces with transparent frames */
     for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
