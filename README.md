@@ -8,13 +8,13 @@ A beautiful, meteor-like mouse cursor trail overlay for Wayland compositors (nir
 
 > ⚠️ **重要警告 / Important Warning**
 >
-> 本项目使用**靶状输入区域**（屏幕中央的十字形微小区域）来检测显示器跳转。
-> 该区域虽然仅约 864 px²（不到屏幕的 0.07%），但在**全屏游戏中可能导致屏幕中央的鼠标点击失灵**（如 FPS 射击、MOBA 等需要频繁点击中央区域的游戏）。
+> 本项目使用**十字形校准区域**（屏幕中央的十字形微小线条）来定期校正光标位置。
+> 该区域虽然仅约 800 px²（不到屏幕的 0.06%），但在**全屏游戏中可能导致屏幕中央的鼠标点击失灵**（如 FPS 射击、MOBA 等需要频繁点击中央区域的游戏）。
 >
 > **请在进入游戏前运行 `mouse-trail-toggle` 关闭拖尾，游戏结束后再次运行开启。**
 >
-> This project uses a **bullseye input region** (a tiny cross-shaped area at screen center) for monitor-switch detection.
-> While only ~864 px² (<0.07% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
+> This project uses a **cross-shaped calibration region** (tiny crosshair lines at screen center) for periodic cursor position correction.
+> While only ~800 px² (<0.06% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
 >
 > **Run `mouse-trail-toggle` to disable the trail before gaming, and again to re-enable after.**
 
@@ -195,42 +195,41 @@ Wayland intentionally prevents clients from querying the global cursor position.
 **Our hybrid approach:**
 - **Continuous tracking**: raw evdev events processed per-event with screen-edge clamping (same behavior as the compositor)
 - **Startup calibration**: full-surface `wl_pointer` capture during first 5 seconds of operation
-- **Drift correction**: bullseye input region provides periodic ground-truth from the compositor
+- **Drift correction**: cross-shaped calibration lines provide periodic absolute position ground-truth from the compositor, eliminating integration drift
+- **Monitor-switch detection**: keyboard hotkey monitoring (Super+Shift+Left/Right) triggers automatic restart with full recalibration
 
 This is the best achievable solution within Wayland's security constraints — we cannot query the cursor position directly, so we combine evdev tracking with opportunistic compositor calibration.
 
-### Bullseye Input Region
+### Cross Calibration Region
 
-After the initial 5-second calibration window, the input region shrinks to a **bullseye pattern** at each output's center:
+After the initial 5-second calibration window, the input region shrinks to a **cross-shaped pattern** at each output's center:
 
 ```
                           ↑
-                          │  2×200 vertical arm
-                          │
-                          │
-                   ┌──────┼──────┐
-                   │      │      │
-                   │      │      │
-    ═══════════════╪══════╪══════╪═══════════════
-    200×2 horiz. →│┌────┐│      │← 200×2 horizontal arm
-    ═══════════════╪│2×10│╪══════╪═══════════════
-                   ││ring││      │
-                   │└────┘│      │
-                   └──────┼──────┘
+                          │  2×200 vertical line
                           │
                           │
                           │
-                          ↓  2×200 vertical arm
+═══════════════════════════╪═══════════════════════════
+      200×2 horizontal →  │  ← 200×2 horizontal line
+═══════════════════════════╪═══════════════════════════
+                          │
+                          │
+                          │
+                          ↓  2×200 vertical line
 ```
 
-Only the cross-shaped lines (2×10 ring center + horizontal/vertical arms) receive pointer events. The rest of the screen has full click passthrough.
+Only the two thin crosshair lines receive pointer events. The rest of the screen has full click passthrough.
 
-- **2×10 ring center** (64 px²): 2px-thick hollow square catches cursor at warp target without blocking the exact center
-- **Horizontal arm** 200×2 (400 px²): catches cursor moving left/right from center
-- **Vertical arm** 2×200 (400 px²): catches cursor moving up/down from center
-- **Total area**: ~864 px² — less than 0.07% of a 1440×900 surface
+- **Horizontal line** 200×2 (400 px²)
+- **Vertical line** 2×200 (400 px²)
+- **Total area**: ~800 px² — less than 0.06% of a 1440×900 surface
 
-**Why this design?** When niri warps the cursor to another monitor, the cursor lands at the output center. If the cursor is hidden (niri's `hide-after-inactive-ms`), the compositor may delay sending `wl_pointer.enter` events. The bullseye arms catch the cursor as it moves away from center in any direction, providing a second chance at calibration. The minimal area ensures everyday clicks are virtually never blocked.
+**Why calibration?** The trail tracks cursor position by integrating velocity from raw evdev events (speed → position). Digital integration inherently accumulates floating-point error over time. When the cursor crosses the calibration crosshair, `wl_pointer` provides an absolute position ground-truth from the compositor, instantly correcting any accumulated drift.
+
+**Why not a full-time full-surface?** Wayland's security model prevents us from simultaneously receiving pointer events (needed for absolute position) and passing clicks through (needed for usability). The crosshair gives us near-full passthrough with just enough surface coverage to periodically catch the cursor for recalibration.
+
+**Monitor-switch detection** is handled separately by monitoring keyboard hotkeys (Super+Shift+Left/Right). A detected screen switch triggers an automatic restart with full-surface calibration.
 
 ### Why 5-second full surface at startup? The initial full-surface window guarantees the cursor position is captured immediately when the trail is first enabled, even if the cursor is stationary. After capture, the bullseye handles subsequent warps.
 
@@ -269,8 +268,7 @@ mouse-trail/
 │   ├── trail.h / trail.c                  # Trail state, ring buffer, cleanup
 │   ├── main.c                             # Wayland, Cairo, input, control, CLI
 │   ├── wlr-layer-shell-client-protocol.h/c # Pre-generated wlr-layer-shell v1
-│   ├── xdg-shell-client-protocol.c        # Pre-generated xdg-shell (dependency)
-│   └── relative-pointer-client-protocol.h/c # Generated (unused, kept for reference)
+│   └── xdg-shell-client-protocol.c        # Pre-generated xdg-shell (dependency)
 ├── mouse-trail.nix                        # Nix home-manager module
 ├── config.example                         # Example configuration
 ├── Makefile                               # Manual gcc compilation
@@ -309,7 +307,7 @@ The original author's NixOS configuration includes automatic theme synchronizati
 
 ### Trail appears at wrong position
 
-This happens when the compositor doesn't send `wl_pointer.enter` at startup (common on niri). The trail initializes at the primary output center. Move the cursor to any screen edge — the boundary clamping will snap the trail to the correct position.
+This can happen when the compositor doesn't send `wl_pointer.enter` at startup (common on niri). The trail initializes at the primary output center. Move the cursor across the screen center (crossing the calibration crosshair) — this will instantly recalibrate the position. Monitor-switch hotkeys (Super+Shift+Left/Right) automatically restart with full calibration.
 
 ### Trail lags behind cursor
 
