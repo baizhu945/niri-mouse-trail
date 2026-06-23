@@ -10,7 +10,7 @@ color=80c8ff
 alpha=0.6
 
 # Head radius in pixels
-width=6
+width=5
 
 # Trail duration in milliseconds
 length=400

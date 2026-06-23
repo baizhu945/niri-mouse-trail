@@ -332,6 +332,7 @@ static void *kbd_thread_fn(void *arg) {
     (void)arg;
     if (!kbd_evdev) return NULL;
     int super_down = 0, shift_down = 0, ctrl_down = 0;
+    uint64_t last_warp_trigger = 0;
     struct input_event ev;
     while (running) {
         int rc = libevdev_next_event(kbd_evdev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
@@ -347,7 +348,9 @@ static void *kbd_thread_fn(void *arg) {
                     if (pressed) ctrl_down = 1; else if (released) ctrl_down = 0; break;
                 case KEY_LEFT:
                 case KEY_RIGHT:
-                    if (pressed && super_down && shift_down) {
+                    if (pressed && super_down && shift_down &&
+                        get_time_ms() - last_warp_trigger > 1000) {
+                        last_warp_trigger = get_time_ms();
                         LOG_INFO("Warp hotkey detected (Super+Shift+%s%s), triggering recalibration",
                                  ev.code == KEY_LEFT ? "Left" : "Right",
                                  ctrl_down ? "+Ctrl" : "");
