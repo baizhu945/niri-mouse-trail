@@ -191,7 +191,7 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
             num_outputs++;
         }
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-        if (!seat) { seat = wl_registry_bind(reg, name, &wl_seat_interface, 5); pointer = wl_seat_get_pointer(seat); }
+        if (!seat) { seat = wl_registry_bind(reg, name, &wl_seat_interface, 2); pointer = wl_seat_get_pointer(seat); }
     }
 }
 static void registry_global_remove(void *data, struct wl_registry *reg, uint32_t name) {
