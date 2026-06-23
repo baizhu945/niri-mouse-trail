@@ -630,9 +630,6 @@ int main(int argc, char *argv[]) {
             warp_recapture = 0;
             LOG_INFO("Bullseye region active (10x10 center + cross)");
         }
-            center_region_set = 1;
-            LOG_INFO("Bullseye region active (10x10 center + cross)");
-        }
 
         while (wl_display_prepare_read(display)!=0) wl_display_dispatch_pending(display);
         wl_display_flush(display);

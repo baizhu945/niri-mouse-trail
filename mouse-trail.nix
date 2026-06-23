@@ -12,21 +12,13 @@ let
 
     buildPhase = ''
       mkdir -p build
-      CFLAGS="$(pkg-config --cflags wayland-client cairo libevdev) -D_GNU_SOURCE -Wall -Wextra -O2 -g -Isrc"
+      CFLAGS="$NIX_CFLAGS_COMPILE $(pkg-config --cflags wayland-client cairo libevdev) -Wall -Wextra -O2 -g -Isrc"
       LIBS="$(pkg-config --libs wayland-client cairo libevdev) -lm"
 
-      gcc $CFLAGS \
-        -c src/trail.c -o build/trail.o
-
-      gcc $CFLAGS \
-        -c src/wlr-layer-shell-client-protocol.c -o build/wlr-layer-shell.o
-
-      gcc $CFLAGS \
-        -c src/xdg-shell-client-protocol.c -o build/xdg-shell.o
-
-      gcc $CFLAGS \
-        -c src/main.c -o build/main.o
-
+      gcc $CFLAGS -c src/trail.c -o build/trail.o
+      gcc $CFLAGS -c src/wlr-layer-shell-client-protocol.c -o build/wlr-layer-shell.o
+      gcc $CFLAGS -c src/xdg-shell-client-protocol.c -o build/xdg-shell.o
+      gcc $CFLAGS -c src/main.c -o build/main.o
       gcc build/trail.o build/wlr-layer-shell.o build/xdg-shell.o build/main.o \
         -o mouse-trail $LIBS
     '';
