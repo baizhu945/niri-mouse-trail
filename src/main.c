@@ -69,6 +69,7 @@ static int timer_fd = -1;
 static int running = 1;
 static int need_redraw = 0;
 static int center_region_set = 0;
+static int outputs_locked = 0;   /* set after initial setup, triggers restart on new outputs */
 
 static int color_cycle_on = 0;
 static double cycle_speed = 5.0;
@@ -183,6 +184,12 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
         layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 2);
     else if (strcmp(interface, wl_output_interface.name) == 0) {
         if (num_outputs < MAX_OUTPUTS) {
+            if (outputs_locked && running) {
+                LOG_INFO("New output detected (hotplug), restarting");
+                if (fork() == 0) { sleep(1); execlp("mouse-trail-toggle","mouse-trail-toggle",NULL); _exit(1); }
+                running = 0;
+                return;
+            }
             struct wl_output *o = wl_registry_bind(reg, name, &wl_output_interface, 3);
             wl_output_add_listener(o, &output_listener, NULL);
             memset(&outputs[num_outputs], 0, sizeof(output_t));
@@ -636,6 +643,7 @@ int main(int argc, char *argv[]) {
     epoll_ctl(epfd, EPOLL_CTL_ADD, display_fd, &evt);
 
     LOG_INFO("Main loop");
+    outputs_locked = 1;
 
     while (running) {
         /* Transition to bullseye: cursor captured, OR startup timeout (5s) */
