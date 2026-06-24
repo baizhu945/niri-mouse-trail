@@ -18,6 +18,27 @@
 
 ---
 
+## 系统要求
+
+使用 mouse-trail 前请确保满足以下条件：
+
+- **Wayland 合成器** 支持 `wlr-layer-shell-unstable-v1`（niri、Sway、Hyprland、River 等）
+- **输入设备权限**：你的用户必须在 `input` 用户组中才能读取 `/dev/input/event*` 设备
+  ```bash
+  sudo usermod -aG input $USER
+  # 重新登录后生效
+  ```
+- **`flat` 加速配置** 以确保鼠标追踪精确。在 niri 中设置：
+  ```kdl
+  mouse {
+      accel-profile "flat"
+  }
+  ```
+- **evtest**（可选，用于调试输入设备）：`nix-shell -p evtest`
+- **手动编译依赖**：`wayland`、`wayland-protocols`、`wlroots`、`cairo`、`libevdev`、`pkg-config`、`gcc`
+
+---
+
 ## 关于本项目
 
 **mouse-trail** 在透明叠加层上渲染一条渐隐的彗星状轨迹，跟随鼠标光标。支持多显示器、实时颜色切换、透明度控制、拖尾宽度/速度可调、HSL 彩虹变色循环，以及自动主题色同步。

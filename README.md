@@ -20,6 +20,27 @@ A beautiful, meteor-like mouse cursor trail overlay for Wayland compositors (nir
 
 ---
 
+## Requirements
+
+Before using mouse-trail, ensure your system meets these prerequisites:
+
+- **Wayland compositor** with `wlr-layer-shell-unstable-v1` support (niri, Sway, Hyprland, River, etc.)
+- **Input device access**: your user must be in the `input` group to read `/dev/input/event*` devices
+  ```bash
+  sudo usermod -aG input $USER
+  # Log out and back in for the change to take effect
+  ```
+- **`flat` acceleration profile** for accurate mouse tracking. Set in niri:
+  ```kdl
+  mouse {
+      accel-profile "flat"
+  }
+  ```
+- **evtest** (optional, for debugging input devices): `nix-shell -p evtest`
+- **Dependencies for manual compilation**: `wayland`, `wayland-protocols`, `wlroots`, `cairo`, `libevdev`, `pkg-config`, `gcc`
+
+---
+
 ## About
 
 **mouse-trail** renders a fading, comet-shaped trail behind your mouse cursor on a transparent overlay. It supports per-monitor surfaces, real-time color changes, opacity control, configurable trail width/speed, HSL color cycling, and automatic theme synchronization.
