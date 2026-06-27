@@ -37,7 +37,7 @@ device=/dev/input/by-id/usb-ITON_Corp._Rapoo_NearLink_Mouse_335844C84037-event-m
 # Keyboard device for hotkey-based warp detection
 # Same as above - use stable by-id/by-path symlinks.
 # Find your stable paths:  ls /dev/input/by-id/*event-kbd*
-kbd_device=/dev/input/by-id/usb-ITON_Corp._Rapoo_NearLink_Mouse_335844C84037-if01-event-kbd
+kbd_device=/dev/input/by-id/usb-SONiX_GS3108T-PRO-event-kbd
 
 # Import another config file
 #import=/path/to/theme.conf
