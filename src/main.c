@@ -361,11 +361,171 @@ static void *input_thread_fn(void *arg) {
     return NULL;
 }
 
+/* Key name to Linux key code mapping */
+typedef struct { const char *name; int code; } key_map_t;
+
+static int lookup_keycode(const char *name) {
+    static const key_map_t keys[] = {
+        {"left", KEY_LEFT}, {"right", KEY_RIGHT}, {"up", KEY_UP}, {"down", KEY_DOWN},
+        {"h", KEY_H}, {"j", KEY_J}, {"k", KEY_K}, {"l", KEY_L},
+        {"a", KEY_A}, {"b", KEY_B}, {"c", KEY_C}, {"d", KEY_D}, {"e", KEY_E},
+        {"f", KEY_F}, {"g", KEY_G}, {"i", KEY_I}, {"m", KEY_M}, {"n", KEY_N},
+        {"o", KEY_O}, {"p", KEY_P}, {"q", KEY_Q}, {"r", KEY_R}, {"s", KEY_S},
+        {"t", KEY_T}, {"u", KEY_U}, {"v", KEY_V}, {"w", KEY_W}, {"x", KEY_X},
+        {"y", KEY_Y}, {"z", KEY_Z},
+        {"1", KEY_1}, {"2", KEY_2}, {"3", KEY_3}, {"4", KEY_4}, {"5", KEY_5},
+        {"6", KEY_6}, {"7", KEY_7}, {"8", KEY_8}, {"9", KEY_9}, {"0", KEY_0},
+        {"comma", KEY_COMMA}, {"period", KEY_DOT}, {"semicolon", KEY_SEMICOLON},
+        {"bracketleft", KEY_LEFTBRACE}, {"bracketright", KEY_RIGHTBRACE},
+        {"tab", KEY_TAB}, {"space", KEY_SPACE}, {"escape", KEY_ESC},
+        {"return", KEY_ENTER}, {"enter", KEY_ENTER},
+        {NULL, 0}
+    };
+    if (!name) return -1;
+    char lower[32]; int i;
+    for (i = 0; name[i] && i < 31; i++) lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
+    lower[i] = '\0';
+    for (const key_map_t *k = keys; k->name; k++)
+        if (strcmp(k->name, lower) == 0) return k->code;
+    return -1;
+}
+
+/* Detected warp binding */
+typedef struct {
+    int key_code;        /* e.g., KEY_LEFT */
+    int need_super;      /* Mod/Mod4/Super required */
+    int need_shift;
+    int need_ctrl;
+    int need_alt;
+} warp_binding_t;
+
+#define MAX_WARP_BINDINGS 8
+static warp_binding_t warp_bindings[MAX_WARP_BINDINGS];
+static int num_warp_bindings = 0;
+
+/* Parse compositor config and extract monitor-switch keybindings */
+static void detect_warp_bindings(void) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char path[512];
+
+    /* Try each compositor config */
+    const char *configs[] = {
+        "/.config/niri/config.kdl",
+        "/.config/sway/config",
+        "/.config/hypr/hyprland.conf",
+        "/.config/hypr/config",
+        NULL
+    };
+
+    for (int ci = 0; configs[ci]; ci++) {
+        snprintf(path, sizeof(path), "%s%s", home, configs[ci]);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+
+        char line[512];
+        int is_niri = strstr(configs[ci], "niri") != NULL;
+        int is_sway = strstr(configs[ci], "sway") != NULL;
+        int is_hypr = strstr(configs[ci], "hypr") != NULL;
+
+        LOG_INFO("Scanning %s for warp bindings", configs[ci] + 1);
+
+        while (fgets(line, sizeof(line), f) && num_warp_bindings < MAX_WARP_BINDINGS) {
+            const char *act = NULL;
+
+            /* Check for known monitor-switch action keywords */
+            if (strstr(line, "focus-monitor-left") || strstr(line, "focus-monitor-right") ||
+                strstr(line, "focus output left") || strstr(line, "focus output right") ||
+                strstr(line, "movefocus, monitor") ||
+                strstr(line, "move-column-to-monitor-left") || strstr(line, "move-column-to-monitor-right") ||
+                strstr(line, "move workspace to output left") || strstr(line, "move workspace to output right")) {
+
+                warp_binding_t wb;
+                memset(&wb, 0, sizeof(wb));
+                wb.key_code = -1;
+
+                /* Extract modifiers and key from the line */
+                char *pline = line;
+                while (*pline == ' ' || *pline == '\t') pline++;
+
+                if (is_niri) {
+                    /* Niri format: Mod+Shift+Left { focus-monitor-left; } */
+                    wb.need_super = (strstr(pline, "Mod") || strstr(pline, "Super"));
+                    wb.need_shift = strstr(pline, "Shift") != NULL;
+                    wb.need_ctrl  = strstr(pline, "Ctrl") != NULL;
+                    wb.need_alt   = strstr(pline, "Alt") != NULL;
+                    /* Extract the last key before { or ): */
+                    char *last = strrchr(pline, '+');
+                    if (last) {
+                        char keyname[32] = {0};
+                        char *ks = last + 1, *kd = keyname;
+                        while (*ks && *ks != ' ' && *ks != '\t' && *ks != '{' && *ks != ')') *kd++ = *ks++;
+                        wb.key_code = lookup_keycode(keyname);
+                    }
+                } else if (is_sway) {
+                    /* Sway format: bindsym Mod4+Shift+Left focus output left */
+                    wb.need_super = (strstr(pline, "Mod4") || strstr(pline, "Super"));
+                    wb.need_shift = strstr(pline, "Shift") != NULL;
+                    wb.need_ctrl  = strstr(pline, "Ctrl") || strstr(pline, "Control");
+                    wb.need_alt   = strstr(pline, "Mod1") || strstr(pline, "Alt");
+                    char *last = strrchr(pline, '+');
+                    if (last) {
+                        char keyname[32] = {0}, *ks = last + 1, *kd = keyname;
+                        while (*ks && *ks != ' ' && *ks != '\t') *kd++ = *ks++;
+                        wb.key_code = lookup_keycode(keyname);
+                    }
+                } else if (is_hypr) {
+                    /* Hyprland format: bind = SUPER SHIFT, left, movefocus, monitor, -1 */
+                    char *eq = strchr(pline, '=');
+                    if (eq) {
+                        char *mods = eq + 1;
+                        while (*mods == ' ') mods++;
+                        wb.need_super = (strstr(mods, "SUPER") || strstr(mods, "super"));
+                        wb.need_shift = strstr(mods, "SHIFT") || strstr(mods, "shift");
+                        wb.need_ctrl  = strstr(mods, "CTRL")  || strstr(mods, "ctrl");
+                        wb.need_alt   = strstr(mods, "ALT")   || strstr(mods, "alt");
+                        /* Key is after comma */
+                        char *comma = strchr(mods, ',');
+                        if (comma) {
+                            char keyname[32] = {0}, *ks = comma + 1, *kd = keyname;
+                            while (*ks == ' ') ks++;
+                            while (*ks && *ks != ' ' && *ks != ',' && *ks != '\t') *kd++ = *ks++;
+                            wb.key_code = lookup_keycode(keyname);
+                        }
+                    }
+                }
+
+                if (wb.key_code >= 0) {
+                    /* Avoid duplicates */
+                    int dup = 0;
+                    for (int i = 0; i < num_warp_bindings; i++)
+                        if (memcmp(&warp_bindings[i], &wb, sizeof(wb)) == 0) { dup = 1; break; }
+                    if (!dup) {
+                        warp_bindings[num_warp_bindings++] = wb;
+                        LOG_INFO("  Detected binding: super=%d shift=%d ctrl=%d alt=%d key=%d",
+                                 wb.need_super, wb.need_shift, wb.need_ctrl, wb.need_alt, wb.key_code);
+                    }
+                }
+            }
+        }
+        fclose(f);
+        if (num_warp_bindings > 0) break; /* Use first config found */
+    }
+
+    /* Fallback: hardcoded defaults */
+    if (num_warp_bindings == 0) {
+        warp_bindings[0].key_code = KEY_LEFT;  warp_bindings[0].need_super = 1; warp_bindings[0].need_shift = 1;
+        warp_bindings[1].key_code = KEY_RIGHT; warp_bindings[1].need_super = 1; warp_bindings[1].need_shift = 1;
+        num_warp_bindings = 2;
+        LOG_INFO("No config found, using default bindings (Super+Shift+Left/Right)");
+    }
+}
+
 /* Keyboard monitor: detect monitor-switch hotkeys and trigger warp */
 static void *kbd_thread_fn(void *arg) {
     (void)arg;
     if (!kbd_evdev) return NULL;
-    int super_down = 0, shift_down = 0, ctrl_down = 0;
+    int super_down = 0, shift_down = 0, ctrl_down = 0, alt_down = 0;
     uint64_t last_warp_trigger = 0;
     struct input_event ev;
     while (running) {
@@ -380,23 +540,30 @@ static void *kbd_thread_fn(void *arg) {
                     if (pressed) shift_down = 1; else if (released) shift_down = 0; break;
                 case KEY_LEFTCTRL: case KEY_RIGHTCTRL:
                     if (pressed) ctrl_down = 1; else if (released) ctrl_down = 0; break;
-                case KEY_LEFT:
-                case KEY_RIGHT:
-                    if (pressed && super_down && shift_down &&
-                        get_time_ms() - last_warp_trigger > 1000) {
-                        last_warp_trigger = get_time_ms();
-                        LOG_INFO("Warp hotkey detected (Super+Shift+%s%s), restarting trail",
-                                 ev.code == KEY_LEFT ? "Left" : "Right",
-                                 ctrl_down ? "+Ctrl" : "");
-                        /* Fork child to restart after parent exits */
-                        if (fork() == 0) {
-                            sleep(1);  /* wait for parent to shutdown */
-                            execlp("mouse-trail-toggle", "mouse-trail-toggle", NULL);
-                            /* Fallback: try direct restart */
-                            execlp("mouse-trail", "mouse-trail", NULL);
-                            _exit(1);
+                case KEY_LEFTALT: case KEY_RIGHTALT:
+                    if (pressed) alt_down = 1; else if (released) alt_down = 0; break;
+                default:
+                    if (pressed && get_time_ms() - last_warp_trigger > 1000) {
+                        /* Check against all detected warp bindings */
+                        for (int i = 0; i < num_warp_bindings; i++) {
+                            warp_binding_t *wb = &warp_bindings[i];
+                            if (ev.code == wb->key_code &&
+                                super_down == wb->need_super &&
+                                shift_down == wb->need_shift &&
+                                ctrl_down  == wb->need_ctrl &&
+                                alt_down   == wb->need_alt) {
+                                last_warp_trigger = get_time_ms();
+                                LOG_INFO("Warp hotkey detected (key=%d), restarting trail", ev.code);
+                                if (fork() == 0) {
+                                    sleep(1);
+                                    execlp("mouse-trail-toggle", "mouse-trail-toggle", NULL);
+                                    execlp("mouse-trail", "mouse-trail", NULL);
+                                    _exit(1);
+                                }
+                                running = 0;
+                                break;
+                            }
                         }
-                        running = 0;
                     }
                     break;
             }
@@ -524,7 +691,13 @@ int main(int argc, char *argv[]) {
         else snprintf(def_cfg, sizeof(def_cfg), "/tmp/mouse-trail-config");
         config_path = def_cfg;
     }
+    /* Save CLI values before config overrides */
+    const char *cli_device = device_path;
+    const char *cli_kbd = kbd_device_path;
     parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms, &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed, &device_path, &kbd_device_path);
+    /* CLI values take priority over config */
+    if (cli_device && strcmp(cli_device, "/dev/input/event2") != 0) device_path = cli_device;
+    if (cli_kbd) kbd_device_path = cli_kbd;
 
     /* Default keyboard device for hotkey detection */
     if (!kbd_device_path) kbd_device_path = "/dev/input/event5";
@@ -629,7 +802,10 @@ int main(int argc, char *argv[]) {
     setup_control_socket(socket_path);
     start_time_ms = get_time_ms();
     pthread_create(&input_thread, NULL, input_thread_fn, NULL);
-    if (kbd_evdev) pthread_create(&kbd_thread, NULL, kbd_thread_fn, NULL);
+    if (kbd_evdev) {
+        detect_warp_bindings();
+        pthread_create(&kbd_thread, NULL, kbd_thread_fn, NULL);
+    }
 
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     struct itimerspec its = {{0,16666667},{0,1}};
