@@ -84,7 +84,7 @@ static uint64_t get_time_ms(void) {
 }
 
 static double hue2rgb(double p, double q, double t) {
-    if (t < 0.0) t += 1.0; if (t > 1.0) t -= 1.0;
+    if (t < 0.0) t += 1.0; else if (t > 1.0) t -= 1.0;
     if (t < 1.0/6.0) return p + (q - p) * 6.0 * t;
     if (t < 1.0/2.0) return q;
     if (t < 2.0/3.0) return p + (q - p) * (2.0/3.0 - t) * 6.0;
@@ -175,7 +175,7 @@ static const struct wl_pointer_listener pointer_listener = {
 
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
     const char *interface, uint32_t version) {
-    (void)data;
+    (void)data;(void)version;
     if (strcmp(interface, wl_compositor_interface.name) == 0)
         compositor = wl_registry_bind(reg, name, &wl_compositor_interface, 4);
     else if (strcmp(interface, wl_shm_interface.name) == 0)
@@ -247,7 +247,7 @@ static struct wl_buffer *create_shm_buffer(int w, int h, void **data_out, int *s
     int stride = w * 4, size = stride * h;
     int fd = memfd_create("mt", MFD_CLOEXEC|MFD_ALLOW_SEALING);
     if (fd < 0) return NULL;
-    ftruncate(fd, size);
+    if (ftruncate(fd, size) < 0) { close(fd); return NULL; }
     void *d = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     if (d == MAP_FAILED) { close(fd); return NULL; }
     struct wl_shm_pool *p = wl_shm_create_pool(shm, fd, size);
@@ -317,7 +317,8 @@ static void setup_control_socket(const char *path) {
     ctrl_fd = socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK, 0);
     if (ctrl_fd < 0) return;
     struct sockaddr_un addr; memset(&addr,0,sizeof(addr)); addr.sun_family=AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path)-1);
+    { size_t len = strlen(path); if (len >= sizeof(addr.sun_path)) len = sizeof(addr.sun_path)-1;
+      memcpy(addr.sun_path, path, len); addr.sun_path[len] = '\0'; }
     if (bind(ctrl_fd,(struct sockaddr*)&addr,sizeof(addr))<0) { close(ctrl_fd); ctrl_fd=-1; return; }
     if (listen(ctrl_fd,5)<0) { close(ctrl_fd); ctrl_fd=-1; return; }
 }
@@ -431,8 +432,6 @@ static void detect_warp_bindings(void) {
         LOG_INFO("Scanning %s for warp bindings", configs[ci] + 1);
 
         while (fgets(line, sizeof(line), f) && num_warp_bindings < MAX_WARP_BINDINGS) {
-            const char *act = NULL;
-
             /* Check for known monitor-switch action keywords */
             if (strstr(line, "focus-monitor-left") || strstr(line, "focus-monitor-right") ||
                 strstr(line, "focus output left") || strstr(line, "focus output right") ||
@@ -577,7 +576,8 @@ static int send_control_cmd(const char *sock, const char *cmd) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return 1;
     struct sockaddr_un addr; memset(&addr,0,sizeof(addr)); addr.sun_family=AF_UNIX;
-    strncpy(addr.sun_path, sock, sizeof(addr.sun_path)-1);
+    { size_t len = strlen(sock); if (len >= sizeof(addr.sun_path)) len = sizeof(addr.sun_path)-1;
+      memcpy(addr.sun_path, sock, len); addr.sun_path[len] = '\0'; }
     if (connect(fd,(struct sockaddr*)&addr,sizeof(addr))<0) { close(fd); return 1; }
     if (write(fd, cmd, strlen(cmd)) < 0) {}
     close(fd); return 0;
@@ -770,7 +770,8 @@ int main(int argc, char *argv[]) {
         if(!o->configured||o->width<=0)continue;
         int stride=o->width*4, size=stride*o->height;
         int fd=memfd_create("init",MFD_CLOEXEC|MFD_ALLOW_SEALING);
-        if(fd<0)continue; ftruncate(fd,size);
+        if(fd<0) continue;
+        if(ftruncate(fd,size) < 0) { close(fd); continue; }
         void*d=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
         if(d==MAP_FAILED){close(fd);continue;} memset(d,0,size);
         struct wl_shm_pool*p=wl_shm_create_pool(shm,fd,size);
@@ -850,7 +851,7 @@ int main(int argc, char *argv[]) {
 
         for (int i=0;i<n;i++) {
             if (events[i].data.fd == timer_fd) {
-                uint64_t exp; read(timer_fd, &exp, sizeof(exp));
+                uint64_t exp; if (read(timer_fd, &exp, sizeof(exp)) < 0) {}
                 uint64_t now = get_time_ms();
 
                 pthread_mutex_lock(&input_mutex);
@@ -879,12 +880,19 @@ int main(int argc, char *argv[]) {
     pthread_cancel(input_thread); pthread_join(input_thread, NULL);
     if (kbd_evdev) { pthread_cancel(kbd_thread); pthread_join(kbd_thread, NULL); }
     for(int i=0;i<num_outputs;i++){ if(outputs[i].layer_surface)zwlr_layer_surface_v1_destroy(outputs[i].layer_surface); if(outputs[i].surface)wl_surface_destroy(outputs[i].surface); if(outputs[i].wl_output)wl_output_destroy(outputs[i].wl_output); }
-    if(pointer)wl_pointer_destroy(pointer); if(seat)wl_seat_destroy(seat);
-    if(compositor)wl_compositor_destroy(compositor); if(shm)wl_shm_destroy(shm); if(layer_shell)zwlr_layer_shell_v1_destroy(layer_shell);
-    if(registry)wl_registry_destroy(registry); if(display)wl_display_disconnect(display);
-    if(evdev)libevdev_free(evdev); if(input_fd>=0)close(input_fd);
-    if(kbd_evdev)libevdev_free(kbd_evdev); if(kbd_fd>=0)close(kbd_fd);
-    if(ctrl_fd>=0){close(ctrl_fd);unlink(socket_path);} if(timer_fd>=0)close(timer_fd);
-    if(g_log_file&&g_log_file!=stderr)fclose(g_log_file);
+    if(pointer) wl_pointer_destroy(pointer);
+    if(seat) wl_seat_destroy(seat);
+    if(compositor) wl_compositor_destroy(compositor);
+    if(shm) wl_shm_destroy(shm);
+    if(layer_shell) zwlr_layer_shell_v1_destroy(layer_shell);
+    if(registry) wl_registry_destroy(registry);
+    if(display) wl_display_disconnect(display);
+    if(evdev) libevdev_free(evdev);
+    if(input_fd >= 0) close(input_fd);
+    if(kbd_evdev) libevdev_free(kbd_evdev);
+    if(kbd_fd >= 0) close(kbd_fd);
+    if(ctrl_fd >= 0) { close(ctrl_fd); unlink(socket_path); }
+    if(timer_fd >= 0) close(timer_fd);
+    if(g_log_file && g_log_file != stderr) fclose(g_log_file);
     return 0;
 }
