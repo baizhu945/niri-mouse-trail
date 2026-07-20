@@ -720,9 +720,11 @@ int main(int argc, char *argv[]) {
             if (tfd < 0) continue;
             struct libevdev *tdev = NULL;
             if (libevdev_new_from_fd(tfd, &tdev) == 0) {
-                if (libevdev_has_event_type(tdev, EV_REL) &&
-                    libevdev_has_event_code(tdev, EV_REL, REL_X) &&
-                    libevdev_has_event_code(tdev, EV_REL, REL_Y)) {
+            if (libevdev_has_event_type(tdev, EV_REL) &&
+                libevdev_has_event_code(tdev, EV_REL, REL_X) &&
+                libevdev_has_event_code(tdev, EV_REL, REL_Y) &&
+                libevdev_has_event_type(tdev, EV_KEY) &&
+                libevdev_has_event_code(tdev, EV_KEY, BTN_LEFT)) {
                     input_fd = tfd;
                     evdev = tdev;
                     LOG_INFO("Auto-detected mouse: %s (%s)", libevdev_get_name(evdev), trypath);
