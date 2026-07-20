@@ -64,8 +64,10 @@ static int is_abs[MAX_MICE];
 static double abs_last_x[MAX_MICE];
 static double abs_last_y[MAX_MICE];
 static int abs_has_pos[MAX_MICE];
-static double abs_pending_dx[MAX_MICE]; /* accumulated delta for this SYN batch */
+static double abs_pending_dx[MAX_MICE];
 static double abs_pending_dy[MAX_MICE];
+static double abs_speed_x[MAX_MICE]; /* adaptive speed factor from ring calibration */
+static double abs_speed_y[MAX_MICE];
 static int num_mice = 0;
 static struct libevdev *kbd_evdev = NULL;
 static int kbd_fd = -1;
@@ -162,14 +164,31 @@ static void ptr_motion(void *d,struct wl_pointer *p,uint32_t t,wl_fixed_t sx,wl_
     double psx = wl_fixed_to_double(sx), psy = wl_fixed_to_double(sy);
     for (int i = 0; i < num_outputs; i++) {
         if (outputs[i].surface == current_pointer_surface) {
-            captured_cursor_x = outputs[i].global_x + psx;
-            captured_cursor_y = outputs[i].global_y + psy;
-            cursor_captured = 1;
+            double real_x = outputs[i].global_x + psx;
+            double real_y = outputs[i].global_y + psy;
+            /* Adaptive ABS speed: compare compositor pos vs our tracked pos */
             pthread_mutex_lock(&input_mutex);
-            trail_set_position(&trail, captured_cursor_x, captured_cursor_y);
+            double error_x = real_x - trail.pos_x;
+            double error_y = real_y - trail.pos_y;
+            captured_cursor_x = real_x;
+            captured_cursor_y = real_y;
+            cursor_captured = 1;
+            trail_set_position(&trail, real_x, real_y);
             need_redraw = 1;
+            /* Adjust speed factor for all ABS devices */
+            for (int m = 0; m < num_mice; m++) {
+                if (!is_abs[m]) continue;
+                double sf_x = (fabs(abs_pending_dx[m]) > 1.0 && fabs(error_x) > 0.0) ?
+                    fabs(abs_pending_dx[m] + error_x) / fabs(abs_pending_dx[m]) : abs_speed_x[m];
+                double sf_y = (fabs(abs_pending_dy[m]) > 1.0 && fabs(error_y) > 0.0) ?
+                    fabs(abs_pending_dy[m] + error_y) / fabs(abs_pending_dy[m]) : abs_speed_y[m];
+                sf_x = sf_x < 0.5 ? 0.5 : (sf_x > 3.0 ? 3.0 : sf_x);
+                sf_y = sf_y < 0.5 ? 0.5 : (sf_y > 3.0 ? 3.0 : sf_y);
+                abs_speed_x[m] = abs_speed_x[m] * 0.8 + sf_x * 0.2; /* EMA smooth */
+                abs_speed_y[m] = abs_speed_y[m] * 0.8 + sf_y * 0.2;
+            }
             pthread_mutex_unlock(&input_mutex);
-            LOG_DEBUG("Recalibrated via motion: output=%d global=(%.0f,%.0f)", i, captured_cursor_x, captured_cursor_y);
+            LOG_DEBUG("Recalibrated via motion: output=%d global=(%.0f,%.0f)", i, real_x, real_y);
             return;
         }
     }
@@ -386,8 +405,8 @@ static void *input_thread_fn(void *arg) {
                             /* Use first output's logical dimensions for scale */
                             double lw = (double)outputs[0].width;
                             double lh = (double)outputs[0].height;
-                            if (ax > 0 && lw > 0) dx = dx / (double)ax * lw;
-                            if (ay > 0 && lh > 0) dy = dy / (double)ay * lh;
+                            if (ax > 0 && lw > 0) dx = dx / (double)ax * lw * abs_speed_x[m];
+                            if (ay > 0 && lh > 0) dy = dy / (double)ay * lh * abs_speed_y[m];
                             pthread_mutex_lock(&input_mutex);
                             double new_x = trail.pos_x + dx;
                             double new_y = trail.pos_y + dy;
@@ -820,6 +839,8 @@ int main(int argc, char *argv[]) {
                         abs_has_pos[num_mice] = 0;
                         abs_pending_dx[num_mice] = 0;
                         abs_pending_dy[num_mice] = 0;
+                        abs_speed_x[num_mice] = 1.0;
+                        abs_speed_y[num_mice] = 1.0;
                         LOG_INFO("Auto-detected %s #%d: %s (%s)",
                                  is_mouse ? "mouse" : "touchpad",
                                  num_mice, libevdev_get_name(tdev), trypath);
