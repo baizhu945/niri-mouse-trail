@@ -60,6 +60,10 @@ static uint64_t start_time_ms = 0;
 #define MAX_MICE 8
 static struct libevdev *evdev[MAX_MICE];
 static int input_fd[MAX_MICE];
+static int is_abs[MAX_MICE];
+static double abs_last_x[MAX_MICE];
+static double abs_last_y[MAX_MICE];
+static int abs_has_pos[MAX_MICE];
 static int num_mice = 0;
 static struct libevdev *kbd_evdev = NULL;
 static int kbd_fd = -1;
@@ -359,6 +363,40 @@ static void *input_thread_fn(void *arg) {
                             }
                         }
                         pthread_mutex_unlock(&input_mutex);
+                    } else if (ev.type == EV_ABS && is_abs[m] &&
+                               (ev.code == ABS_X || ev.code == ABS_Y)) {
+                        double *last = (ev.code == ABS_X) ? &abs_last_x[m] : &abs_last_y[m];
+                        double cur = (double)ev.value;
+                        if (!abs_has_pos[m]) { *last = cur; abs_has_pos[m] = 1; }
+                        else if (cur != *last) {
+                            double delta = cur - *last;
+                            *last = cur;
+                            pthread_mutex_lock(&input_mutex);
+                            double dx = (ev.code == ABS_X) ? delta : 0.0;
+                            double dy = (ev.code == ABS_Y) ? delta : 0.0;
+                            if (dx != 0.0 || dy != 0.0) {
+                                double new_x = trail.pos_x + dx;
+                                double new_y = trail.pos_y + dy;
+                                if (new_x < bounds_min_x) { trail.pos_x = bounds_min_x; }
+                                else if (new_x > bounds_max_x) { trail.pos_x = bounds_max_x; }
+                                else trail.pos_x = new_x;
+                                if (new_y < bounds_min_y) { trail.pos_y = bounds_min_y; }
+                                else if (new_y > bounds_max_y) { trail.pos_y = bounds_max_y; }
+                                else trail.pos_y = new_y;
+                                int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
+                                trail.points[idx].x = trail.pos_x;
+                                trail.points[idx].y = trail.pos_y;
+                                trail.points[idx].timestamp_ms = get_time_ms();
+                                if (trail.count < MAX_TRAIL_POINTS) trail.count++;
+                                else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
+                                trail.stationary_start = 0;
+                                need_redraw = 1;
+                            }
+                            pthread_mutex_unlock(&input_mutex);
+                        }
+                    } else if (ev.type == EV_KEY && is_abs[m] &&
+                               ev.code == BTN_TOUCH && ev.value == 0) {
+                        abs_has_pos[m] = 0;
                     }
                 } else { break; }
             }
@@ -722,6 +760,10 @@ int main(int argc, char *argv[]) {
         if (fd >= 0 && libevdev_new_from_fd(fd, &evdev[0]) == 0) {
             num_mice = 1;
             input_fd[0] = fd;
+            is_abs[0] = libevdev_has_event_type(evdev[0], EV_ABS) &&
+                        libevdev_has_event_code(evdev[0], EV_ABS, ABS_X) &&
+                        libevdev_has_event_code(evdev[0], EV_ABS, ABS_Y);
+            abs_has_pos[0] = 0;
             LOG_INFO("Mouse: %s (%s)", libevdev_get_name(evdev[0]), device_path);
         } else {
             if (fd >= 0) close(fd);
@@ -733,14 +775,37 @@ int main(int argc, char *argv[]) {
                 if (tfd < 0) continue;
                 struct libevdev *tdev = NULL;
                 if (libevdev_new_from_fd(tfd, &tdev) == 0) {
+                    int is_mouse = 0, is_absdev = 0;
                     if (libevdev_has_event_type(tdev, EV_REL) &&
                         libevdev_has_event_code(tdev, EV_REL, REL_X) &&
                         libevdev_has_event_code(tdev, EV_REL, REL_Y) &&
                         libevdev_has_event_type(tdev, EV_KEY) &&
-                        libevdev_has_event_code(tdev, EV_KEY, BTN_LEFT)) {
+                        libevdev_has_event_code(tdev, EV_KEY, BTN_LEFT))
+                        is_mouse = 1;
+                    if (libevdev_has_event_type(tdev, EV_ABS) &&
+                        libevdev_has_event_code(tdev, EV_ABS, ABS_X) &&
+                        libevdev_has_event_code(tdev, EV_ABS, ABS_Y))
+                        is_absdev = 1;
+                    if (is_mouse || is_absdev) {
+                        /* Dedup: if same phys has both REL and ABS, prefer ABS (touchpad) */
+                        const char *phys = libevdev_get_phys(tdev);
+                        if (phys && is_mouse) {
+                            int has_abs = 0;
+                            for (int m = 0; m < num_mice; m++)
+                                if (evdev[m] && libevdev_get_phys(evdev[m]) &&
+                                    strcmp(libevdev_get_phys(evdev[m]), phys) == 0 &&
+                                    is_abs[m]) { has_abs = 1; break; }
+                            if (has_abs) { libevdev_free(tdev); close(tfd); continue; }
+                        }
                         evdev[num_mice] = tdev;
                         input_fd[num_mice] = tfd;
-                        LOG_INFO("Auto-detected mouse #%d: %s (%s)", num_mice, libevdev_get_name(tdev), trypath);
+                        is_abs[num_mice] = is_absdev;
+                        abs_last_x[num_mice] = 0;
+                        abs_last_y[num_mice] = 0;
+                        abs_has_pos[num_mice] = 0;
+                        LOG_INFO("Auto-detected %s #%d: %s (%s)",
+                                 is_mouse ? "mouse" : "touchpad",
+                                 num_mice, libevdev_get_name(tdev), trypath);
                         num_mice++;
                         continue;
                     }
@@ -750,6 +815,29 @@ int main(int argc, char *argv[]) {
             }
         }
         if (num_mice == 0) { LOG_ERROR("No mouse found"); return 1; }
+
+        /* Remove REL devices that have an ABS sibling (prevent double-track) */
+        for (int m = 0; m < num_mice; m++) {
+            if (is_abs[m]) continue;
+            const char *phys = libevdev_get_phys(evdev[m]);
+            if (!phys) continue;
+            for (int n = 0; n < num_mice; n++) {
+                if (n != m && is_abs[n] && libevdev_get_phys(evdev[n]) &&
+                    strcmp(libevdev_get_phys(evdev[n]), phys) == 0) {
+                    LOG_INFO("Dropping REL device #%d (ABS sibling #%d exists)", m, n);
+                    libevdev_free(evdev[m]); close(input_fd[m]);
+                    /* Shift remaining */
+                    for (int k = m; k < num_mice - 1; k++) {
+                        evdev[k] = evdev[k+1]; input_fd[k] = input_fd[k+1];
+                        is_abs[k] = is_abs[k+1];
+                        abs_last_x[k] = abs_last_x[k+1]; abs_last_y[k] = abs_last_y[k+1];
+                        abs_has_pos[k] = abs_has_pos[k+1];
+                    }
+                    num_mice--; m--;
+                    break;
+                }
+            }
+        }
     }
 
     trail_init(&trail, width, length_ms, min_speed, smooth_factor, cr, cg, cb, ca);
