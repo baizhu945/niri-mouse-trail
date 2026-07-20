@@ -380,11 +380,14 @@ static void *input_thread_fn(void *arg) {
                         double dx = abs_pending_dx[m], dy = abs_pending_dy[m];
                         abs_pending_dx[m] = 0; abs_pending_dy[m] = 0;
                         if (dx != 0.0 || dy != 0.0) {
-                            /* Scale ABS device units to screen pixels */
+                            /* Scale ABS → logical screen pixels (after output scale) */
                             int ax = libevdev_get_abs_maximum(evdev[m], ABS_X) - libevdev_get_abs_minimum(evdev[m], ABS_X);
                             int ay = libevdev_get_abs_maximum(evdev[m], ABS_Y) - libevdev_get_abs_minimum(evdev[m], ABS_Y);
-                            if (ax > 0) dx = dx / (double)ax * (double)outputs[0].phys_w;
-                            if (ay > 0) dy = dy / (double)ay * (double)outputs[0].phys_h;
+                            /* Use first output's logical dimensions for scale */
+                            double lw = (double)outputs[0].width;
+                            double lh = (double)outputs[0].height;
+                            if (ax > 0 && lw > 0) dx = dx / (double)ax * lw;
+                            if (ay > 0 && lh > 0) dy = dy / (double)ay * lh;
                             pthread_mutex_lock(&input_mutex);
                             double new_x = trail.pos_x + dx;
                             double new_y = trail.pos_y + dy;
