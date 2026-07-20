@@ -711,20 +711,61 @@ int main(int argc, char *argv[]) {
     LOG_INFO("mouse-trail v0.11");
 
     input_fd = open(device_path, O_RDONLY|O_NONBLOCK);
-    if (input_fd<0) { LOG_ERROR("Cannot open %s: %s",device_path,strerror(errno)); return 1; }
-    if (libevdev_new_from_fd(input_fd, &evdev)<0) { LOG_ERROR("libevdev failed"); close(input_fd); return 1; }
+    if (input_fd < 0) {
+        LOG_WARN("Cannot open %s: %s, auto-detecting mouse", device_path, strerror(errno));
+        char trypath[32];
+        for (int en = 0; en < 32; en++) {
+            snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
+            int tfd = open(trypath, O_RDONLY|O_NONBLOCK);
+            if (tfd < 0) continue;
+            struct libevdev *tdev = NULL;
+            if (libevdev_new_from_fd(tfd, &tdev) == 0) {
+                if (libevdev_has_event_type(tdev, EV_REL) &&
+                    libevdev_has_event_code(tdev, EV_REL, REL_X) &&
+                    libevdev_has_event_code(tdev, EV_REL, REL_Y)) {
+                    input_fd = tfd;
+                    evdev = tdev;
+                    LOG_INFO("Auto-detected mouse: %s (%s)", libevdev_get_name(evdev), trypath);
+                    break;
+                }
+                libevdev_free(tdev);
+            }
+            close(tfd);
+        }
+        if (input_fd < 0) { LOG_ERROR("No mouse found"); return 1; }
+    } else {
+        if (libevdev_new_from_fd(input_fd, &evdev) < 0) { LOG_ERROR("libevdev failed"); close(input_fd); return 1; }
+    }
 
     trail_init(&trail, width, length_ms, min_speed, smooth_factor, cr, cg, cb, ca);
 
     /* Open keyboard device for hotkey monitoring */
     kbd_fd = open(kbd_device_path, O_RDONLY|O_NONBLOCK);
-    if (kbd_fd >= 0 && libevdev_new_from_fd(kbd_fd, &kbd_evdev) >= 0) {
-        LOG_INFO("Keyboard: %s (%s)", libevdev_get_name(kbd_evdev), kbd_device_path);
+    if (kbd_fd < 0 || libevdev_new_from_fd(kbd_fd, &kbd_evdev) < 0) {
+        if (kbd_fd >= 0) { close(kbd_fd); kbd_fd = -1; }
+        LOG_WARN("Cannot open keyboard %s, auto-detecting", kbd_device_path);
+        char trypath[32];
+        for (int en = 0; en < 32 && !kbd_evdev; en++) {
+            snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
+            int tfd = open(trypath, O_RDONLY|O_NONBLOCK);
+            if (tfd < 0) continue;
+            struct libevdev *tdev = NULL;
+            if (libevdev_new_from_fd(tfd, &tdev) == 0) {
+                if (libevdev_has_event_type(tdev, EV_KEY) &&
+                    libevdev_has_event_code(tdev, EV_KEY, KEY_A) &&
+                    libevdev_has_event_code(tdev, EV_KEY, KEY_ESC)) {
+                    kbd_fd = tfd;
+                    kbd_evdev = tdev;
+                    LOG_INFO("Auto-detected keyboard: %s (%s)", libevdev_get_name(kbd_evdev), trypath);
+                    break;
+                }
+                libevdev_free(tdev);
+            }
+            close(tfd);
+        }
+        if (!kbd_evdev) LOG_WARN("No keyboard found, warp hotkey detection disabled");
     } else {
-        if (kbd_fd >= 0) close(kbd_fd);
-        kbd_fd = -1;
-        kbd_evdev = NULL;
-        LOG_WARN("Cannot open keyboard %s, warp hotkey detection disabled", kbd_device_path);
+        LOG_INFO("Keyboard: %s (%s)", libevdev_get_name(kbd_evdev), kbd_device_path);
     }
 
     display = wl_display_connect(NULL);
