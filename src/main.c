@@ -64,6 +64,8 @@ static int is_abs[MAX_MICE];
 static double abs_last_x[MAX_MICE];
 static double abs_last_y[MAX_MICE];
 static int abs_has_pos[MAX_MICE];
+static double abs_pending_dx[MAX_MICE]; /* accumulated delta for this SYN batch */
+static double abs_pending_dy[MAX_MICE];
 static int num_mice = 0;
 static struct libevdev *kbd_evdev = NULL;
 static int kbd_fd = -1;
@@ -366,37 +368,47 @@ static void *input_thread_fn(void *arg) {
                     } else if (ev.type == EV_ABS && is_abs[m] &&
                                (ev.code == ABS_X || ev.code == ABS_Y)) {
                         double *last = (ev.code == ABS_X) ? &abs_last_x[m] : &abs_last_y[m];
+                        double *pending = (ev.code == ABS_X) ? &abs_pending_dx[m] : &abs_pending_dy[m];
                         double cur = (double)ev.value;
                         if (!abs_has_pos[m]) { *last = cur; abs_has_pos[m] = 1; }
                         else if (cur != *last) {
-                            double delta = cur - *last;
+                            *pending += (cur - *last);
                             *last = cur;
+                        }
+                    } else if (ev.type == EV_SYN && ev.code == SYN_REPORT && is_abs[m]) {
+                        /* Apply accumulated ABS deltas on SYN_REPORT, scaled to screen px */
+                        double dx = abs_pending_dx[m], dy = abs_pending_dy[m];
+                        abs_pending_dx[m] = 0; abs_pending_dy[m] = 0;
+                        if (dx != 0.0 || dy != 0.0) {
+                            /* Scale ABS device units to screen pixels */
+                            int ax = libevdev_get_abs_maximum(evdev[m], ABS_X) - libevdev_get_abs_minimum(evdev[m], ABS_X);
+                            int ay = libevdev_get_abs_maximum(evdev[m], ABS_Y) - libevdev_get_abs_minimum(evdev[m], ABS_Y);
+                            if (ax > 0) dx = dx / (double)ax * (double)outputs[0].phys_w;
+                            if (ay > 0) dy = dy / (double)ay * (double)outputs[0].phys_h;
                             pthread_mutex_lock(&input_mutex);
-                            double dx = (ev.code == ABS_X) ? delta : 0.0;
-                            double dy = (ev.code == ABS_Y) ? delta : 0.0;
-                            if (dx != 0.0 || dy != 0.0) {
-                                double new_x = trail.pos_x + dx;
-                                double new_y = trail.pos_y + dy;
-                                if (new_x < bounds_min_x) { trail.pos_x = bounds_min_x; }
-                                else if (new_x > bounds_max_x) { trail.pos_x = bounds_max_x; }
-                                else trail.pos_x = new_x;
-                                if (new_y < bounds_min_y) { trail.pos_y = bounds_min_y; }
-                                else if (new_y > bounds_max_y) { trail.pos_y = bounds_max_y; }
-                                else trail.pos_y = new_y;
-                                int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
-                                trail.points[idx].x = trail.pos_x;
-                                trail.points[idx].y = trail.pos_y;
-                                trail.points[idx].timestamp_ms = get_time_ms();
-                                if (trail.count < MAX_TRAIL_POINTS) trail.count++;
-                                else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
-                                trail.stationary_start = 0;
-                                need_redraw = 1;
-                            }
+                            double new_x = trail.pos_x + dx;
+                            double new_y = trail.pos_y + dy;
+                            if (new_x < bounds_min_x) { trail.pos_x = bounds_min_x; }
+                            else if (new_x > bounds_max_x) { trail.pos_x = bounds_max_x; }
+                            else trail.pos_x = new_x;
+                            if (new_y < bounds_min_y) { trail.pos_y = bounds_min_y; }
+                            else if (new_y > bounds_max_y) { trail.pos_y = bounds_max_y; }
+                            else trail.pos_y = new_y;
+                            int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
+                            trail.points[idx].x = trail.pos_x;
+                            trail.points[idx].y = trail.pos_y;
+                            trail.points[idx].timestamp_ms = get_time_ms();
+                            if (trail.count < MAX_TRAIL_POINTS) trail.count++;
+                            else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
+                            trail.stationary_start = 0;
+                            need_redraw = 1;
                             pthread_mutex_unlock(&input_mutex);
                         }
                     } else if (ev.type == EV_KEY && is_abs[m] &&
                                ev.code == BTN_TOUCH && ev.value == 0) {
                         abs_has_pos[m] = 0;
+                        abs_pending_dx[m] = 0;
+                        abs_pending_dy[m] = 0;
                     }
                 } else { break; }
             }
@@ -803,6 +815,8 @@ int main(int argc, char *argv[]) {
                         abs_last_x[num_mice] = 0;
                         abs_last_y[num_mice] = 0;
                         abs_has_pos[num_mice] = 0;
+                        abs_pending_dx[num_mice] = 0;
+                        abs_pending_dy[num_mice] = 0;
                         LOG_INFO("Auto-detected %s #%d: %s (%s)",
                                  is_mouse ? "mouse" : "touchpad",
                                  num_mice, libevdev_get_name(tdev), trypath);
