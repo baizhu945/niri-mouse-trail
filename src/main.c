@@ -57,8 +57,10 @@ static struct wl_surface *current_pointer_surface = NULL;
 static trail_state_t trail;
 static uint64_t start_time_ms = 0;
 
-static struct libevdev *evdev = NULL;
-static int input_fd = -1;
+#define MAX_MICE 4
+static struct libevdev *evdev[MAX_MICE];
+static int input_fd[MAX_MICE];
+static int num_mice = 0;
 static struct libevdev *kbd_evdev = NULL;
 static int kbd_fd = -1;
 static pthread_t input_thread, kbd_thread;
@@ -327,37 +329,41 @@ static void *input_thread_fn(void *arg) {
     (void)arg;
     struct input_event ev;
     while (running) {
-        int rc = libevdev_next_event(evdev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-        if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
-            if (ev.type == EV_REL && (ev.code == REL_X || ev.code == REL_Y)) {
-                pthread_mutex_lock(&input_mutex);
-                double dx = (ev.code == REL_X) ? (double)ev.value : 0.0;
-                double dy = (ev.code == REL_Y) ? (double)ev.value : 0.0;
-                if (dx != 0.0 || dy != 0.0) {
-                    /* Per-event clamping matches compositor behavior */
-                    double new_x = trail.pos_x + dx;
-                    double new_y = trail.pos_y + dy;
-                    if (new_x < bounds_min_x) { dx = bounds_min_x - trail.pos_x; trail.pos_x = bounds_min_x; }
-                    else if (new_x > bounds_max_x) { dx = bounds_max_x - trail.pos_x; trail.pos_x = bounds_max_x; }
-                    else trail.pos_x = new_x;
-                    if (new_y < bounds_min_y) { dy = bounds_min_y - trail.pos_y; trail.pos_y = bounds_min_y; }
-                    else if (new_y > bounds_max_y) { dy = bounds_max_y - trail.pos_y; trail.pos_y = bounds_max_y; }
-                    else trail.pos_y = new_y;
-                    if (dx != 0.0 || dy != 0.0) {
-                        int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
-                        trail.points[idx].x = trail.pos_x;
-                        trail.points[idx].y = trail.pos_y;
-                        trail.points[idx].timestamp_ms = get_time_ms();
-                        if (trail.count < MAX_TRAIL_POINTS) trail.count++;
-                        else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
-                        trail.stationary_start = 0;
-                        need_redraw = 1;
+        for (int m = 0; m < num_mice; m++) {
+            if (!evdev[m]) continue;
+            while (running) {
+                int rc = libevdev_next_event(evdev[m], LIBEVDEV_READ_FLAG_NORMAL, &ev);
+                if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+                    if (ev.type == EV_REL && (ev.code == REL_X || ev.code == REL_Y)) {
+                        pthread_mutex_lock(&input_mutex);
+                        double dx = (ev.code == REL_X) ? (double)ev.value : 0.0;
+                        double dy = (ev.code == REL_Y) ? (double)ev.value : 0.0;
+                        if (dx != 0.0 || dy != 0.0) {
+                            double new_x = trail.pos_x + dx;
+                            double new_y = trail.pos_y + dy;
+                            if (new_x < bounds_min_x) { trail.pos_x = bounds_min_x; }
+                            else if (new_x > bounds_max_x) { trail.pos_x = bounds_max_x; }
+                            else trail.pos_x = new_x;
+                            if (new_y < bounds_min_y) { trail.pos_y = bounds_min_y; }
+                            else if (new_y > bounds_max_y) { trail.pos_y = bounds_max_y; }
+                            else trail.pos_y = new_y;
+                            if (dx != 0.0 || dy != 0.0) {
+                                int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
+                                trail.points[idx].x = trail.pos_x;
+                                trail.points[idx].y = trail.pos_y;
+                                trail.points[idx].timestamp_ms = get_time_ms();
+                                if (trail.count < MAX_TRAIL_POINTS) trail.count++;
+                                else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
+                                trail.stationary_start = 0;
+                                need_redraw = 1;
+                            }
+                        }
+                        pthread_mutex_unlock(&input_mutex);
                     }
-                }
-                pthread_mutex_unlock(&input_mutex);
+                } else { break; }
             }
-        } else if (rc == -EAGAIN) { usleep(200); }
-        else if (rc < 0 && rc != -ENODEV) break;
+        }
+        usleep(200);
     }
     return NULL;
 }
@@ -710,33 +716,40 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("mouse-trail v0.11");
 
-    input_fd = open(device_path, O_RDONLY|O_NONBLOCK);
-    if (input_fd < 0) {
-        LOG_WARN("Cannot open %s: %s, auto-detecting mouse", device_path, strerror(errno));
-        char trypath[32];
-        for (int en = 0; en < 32; en++) {
-            snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
-            int tfd = open(trypath, O_RDONLY|O_NONBLOCK);
-            if (tfd < 0) continue;
-            struct libevdev *tdev = NULL;
-            if (libevdev_new_from_fd(tfd, &tdev) == 0) {
-            if (libevdev_has_event_type(tdev, EV_REL) &&
-                libevdev_has_event_code(tdev, EV_REL, REL_X) &&
-                libevdev_has_event_code(tdev, EV_REL, REL_Y) &&
-                libevdev_has_event_type(tdev, EV_KEY) &&
-                libevdev_has_event_code(tdev, EV_KEY, BTN_LEFT)) {
-                    input_fd = tfd;
-                    evdev = tdev;
-                    LOG_INFO("Auto-detected mouse: %s (%s)", libevdev_get_name(evdev), trypath);
-                    break;
+    /* Open mouse devices — try configured path, then auto-detect all matching */
+    {
+        int fd = open(device_path, O_RDONLY|O_NONBLOCK);
+        if (fd >= 0 && libevdev_new_from_fd(fd, &evdev[0]) == 0) {
+            num_mice = 1;
+            input_fd[0] = fd;
+            LOG_INFO("Mouse: %s (%s)", libevdev_get_name(evdev[0]), device_path);
+        } else {
+            if (fd >= 0) close(fd);
+            LOG_INFO("Auto-detecting mouse devices");
+            char trypath[32];
+            for (int en = 0; en < 32 && num_mice < MAX_MICE; en++) {
+                snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
+                int tfd = open(trypath, O_RDONLY|O_NONBLOCK);
+                if (tfd < 0) continue;
+                struct libevdev *tdev = NULL;
+                if (libevdev_new_from_fd(tfd, &tdev) == 0) {
+                    if (libevdev_has_event_type(tdev, EV_REL) &&
+                        libevdev_has_event_code(tdev, EV_REL, REL_X) &&
+                        libevdev_has_event_code(tdev, EV_REL, REL_Y) &&
+                        libevdev_has_event_type(tdev, EV_KEY) &&
+                        libevdev_has_event_code(tdev, EV_KEY, BTN_LEFT)) {
+                        evdev[num_mice] = tdev;
+                        input_fd[num_mice] = tfd;
+                        LOG_INFO("Auto-detected mouse #%d: %s (%s)", num_mice, libevdev_get_name(tdev), trypath);
+                        num_mice++;
+                        continue;
+                    }
+                    libevdev_free(tdev);
                 }
-                libevdev_free(tdev);
+                close(tfd);
             }
-            close(tfd);
         }
-        if (input_fd < 0) { LOG_ERROR("No mouse found"); return 1; }
-    } else {
-        if (libevdev_new_from_fd(input_fd, &evdev) < 0) { LOG_ERROR("libevdev failed"); close(input_fd); return 1; }
+        if (num_mice == 0) { LOG_ERROR("No mouse found"); return 1; }
     }
 
     trail_init(&trail, width, length_ms, min_speed, smooth_factor, cr, cg, cb, ca);
@@ -771,7 +784,7 @@ int main(int argc, char *argv[]) {
     }
 
     display = wl_display_connect(NULL);
-    if (!display) { LOG_ERROR("Wayland connect failed"); libevdev_free(evdev); close(input_fd); return 1; }
+    if (!display) { LOG_ERROR("Wayland connect failed"); for(int m=0;m<num_mice;m++){if(evdev[m])libevdev_free(evdev[m]);if(input_fd[m]>=0)close(input_fd[m]);} return 1; }
 
     registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
@@ -930,8 +943,7 @@ int main(int argc, char *argv[]) {
     if(layer_shell) zwlr_layer_shell_v1_destroy(layer_shell);
     if(registry) wl_registry_destroy(registry);
     if(display) wl_display_disconnect(display);
-    if(evdev) libevdev_free(evdev);
-    if(input_fd >= 0) close(input_fd);
+    for(int m=0; m<num_mice; m++){ if(evdev[m]) libevdev_free(evdev[m]); if(input_fd[m] >= 0) close(input_fd[m]); }
     if(kbd_evdev) libevdev_free(kbd_evdev);
     if(kbd_fd >= 0) close(kbd_fd);
     if(ctrl_fd >= 0) { close(ctrl_fd); unlink(socket_path); }
