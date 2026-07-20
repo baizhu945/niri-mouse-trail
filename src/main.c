@@ -60,12 +60,6 @@ static uint64_t start_time_ms = 0;
 #define MAX_MICE 8
 static struct libevdev *evdev[MAX_MICE];
 static int input_fd[MAX_MICE];
-static int is_abs[MAX_MICE];       /* 1 if device uses ABS (touchpad), 0 for REL */
-static double abs_last_x[MAX_MICE]; /* last known ABS position for delta calc */
-static double abs_last_y[MAX_MICE];
-static int abs_has_pos[MAX_MICE];  /* whether we have a valid last position */
-static double abs_scale_x[MAX_MICE]; /* ABS unit → pixel */
-static double abs_scale_y[MAX_MICE];
 static int num_mice = 0;
 static struct libevdev *kbd_evdev = NULL;
 static int kbd_fd = -1;
@@ -365,44 +359,6 @@ static void *input_thread_fn(void *arg) {
                             }
                         }
                         pthread_mutex_unlock(&input_mutex);
-                    } else if (ev.type == EV_ABS && is_abs[m] &&
-                               (ev.code == ABS_X || ev.code == ABS_Y)) {
-                        /* Touchpad: compute delta from last known position */
-                        double *last = (ev.code == ABS_X) ? &abs_last_x[m] : &abs_last_y[m];
-                        double cur = (double)ev.value;
-                        if (!abs_has_pos[m]) { *last = cur; abs_has_pos[m] = 1; }
-                        else if (cur != *last) {
-                            double delta = cur - *last;
-                            *last = cur;
-                            if (ev.code == ABS_X && abs_scale_x[m] > 0) delta *= abs_scale_x[m];
-                            if (ev.code == ABS_Y && abs_scale_y[m] > 0) delta *= abs_scale_y[m];
-                            pthread_mutex_lock(&input_mutex);
-                            double dx = (ev.code == ABS_X) ? delta : 0.0;
-                            double dy = (ev.code == ABS_Y) ? delta : 0.0;
-                            if (dx != 0.0 || dy != 0.0) {
-                                double new_x = trail.pos_x + dx;
-                                double new_y = trail.pos_y + dy;
-                                if (new_x < bounds_min_x) { trail.pos_x = bounds_min_x; }
-                                else if (new_x > bounds_max_x) { trail.pos_x = bounds_max_x; }
-                                else trail.pos_x = new_x;
-                                if (new_y < bounds_min_y) { trail.pos_y = bounds_min_y; }
-                                else if (new_y > bounds_max_y) { trail.pos_y = bounds_max_y; }
-                                else trail.pos_y = new_y;
-                                int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
-                                trail.points[idx].x = trail.pos_x;
-                                trail.points[idx].y = trail.pos_y;
-                                trail.points[idx].timestamp_ms = get_time_ms();
-                                if (trail.count < MAX_TRAIL_POINTS) trail.count++;
-                                else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
-                                trail.stationary_start = 0;
-                                need_redraw = 1;
-                            }
-                            pthread_mutex_unlock(&input_mutex);
-                        }
-                    } else if (ev.type == EV_KEY && is_abs[m] &&
-                               ev.code == BTN_TOUCH && ev.value == 0) {
-                        /* Finger lifted: reset tracking */
-                        abs_has_pos[m] = 0;
                     }
                 } else { break; }
             }
@@ -766,60 +722,25 @@ int main(int argc, char *argv[]) {
         if (fd >= 0 && libevdev_new_from_fd(fd, &evdev[0]) == 0) {
             num_mice = 1;
             input_fd[0] = fd;
-            is_abs[0] = libevdev_has_event_type(evdev[0], EV_ABS) &&
-                        libevdev_has_event_code(evdev[0], EV_ABS, ABS_X) &&
-                        libevdev_has_event_code(evdev[0], EV_ABS, ABS_Y);
-            abs_has_pos[0] = 0;
-            LOG_INFO("Mouse: %s (%s) %s", libevdev_get_name(evdev[0]), device_path,
-                     is_abs[0] ? "(ABS/touchpad)" : "(REL)");
+            LOG_INFO("Mouse: %s (%s)", libevdev_get_name(evdev[0]), device_path);
         } else {
             if (fd >= 0) close(fd);
             LOG_INFO("Auto-detecting mouse devices");
             char trypath[32];
-            const char *seen_phys[8] = {0}; int seen_is_abs[8] = {0}; int nseen = 0;
             for (int en = 0; en < 32 && num_mice < MAX_MICE; en++) {
                 snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
                 int tfd = open(trypath, O_RDONLY|O_NONBLOCK);
                 if (tfd < 0) continue;
                 struct libevdev *tdev = NULL;
                 if (libevdev_new_from_fd(tfd, &tdev) == 0) {
-                    int is_mouse = 0, is_touchpad = 0;
                     if (libevdev_has_event_type(tdev, EV_REL) &&
                         libevdev_has_event_code(tdev, EV_REL, REL_X) &&
                         libevdev_has_event_code(tdev, EV_REL, REL_Y) &&
                         libevdev_has_event_type(tdev, EV_KEY) &&
-                        libevdev_has_event_code(tdev, EV_KEY, BTN_LEFT))
-                        is_mouse = 1;
-                    if (libevdev_has_event_type(tdev, EV_ABS) &&
-                        libevdev_has_event_code(tdev, EV_ABS, ABS_X) &&
-                        libevdev_has_event_code(tdev, EV_ABS, ABS_Y))
-                        is_touchpad = 1;
-                    if (is_mouse || is_touchpad) {
-                        /* Dedup by phys: only skip if same type (REL/ABS) already seen */
-                        const char *phys = libevdev_get_phys(tdev);
-                        int dup = 0;
-                        if (phys) for (int s = 0; s < nseen; s++)
-                            if (seen_phys[s] && strcmp(seen_phys[s], phys) == 0 &&
-                                seen_is_abs[s] == is_touchpad) { dup = 1; break; }
-                        if (dup) { libevdev_free(tdev); close(tfd); continue; }
-                        if (phys && nseen < 8) { seen_phys[nseen] = phys; seen_is_abs[nseen++] = is_touchpad; }
-
+                        libevdev_has_event_code(tdev, EV_KEY, BTN_LEFT)) {
                         evdev[num_mice] = tdev;
                         input_fd[num_mice] = tfd;
-                        is_abs[num_mice] = is_touchpad;
-                        abs_last_x[num_mice] = 0;
-                        abs_last_y[num_mice] = 0;
-                        abs_has_pos[num_mice] = 0;
-                        /* Compute ABS→pixel scale: range maps to screen diagonal */
-                        if (is_touchpad) {
-                            int rx = libevdev_get_abs_maximum(tdev, ABS_X) - libevdev_get_abs_minimum(tdev, ABS_X);
-                            int ry = libevdev_get_abs_maximum(tdev, ABS_Y) - libevdev_get_abs_minimum(tdev, ABS_Y);
-                            abs_scale_x[num_mice] = (rx > 0) ? (double)outputs[0].phys_w / (double)rx : 1.0;
-                            abs_scale_y[num_mice] = (ry > 0) ? (double)outputs[0].phys_h / (double)ry : 1.0;
-                        }
-                        LOG_INFO("Auto-detected %s #%d: %s (%s)",
-                                 is_touchpad ? "touchpad" : "mouse",
-                                 num_mice, libevdev_get_name(tdev), trypath);
+                        LOG_INFO("Auto-detected mouse #%d: %s (%s)", num_mice, libevdev_get_name(tdev), trypath);
                         num_mice++;
                         continue;
                     }
