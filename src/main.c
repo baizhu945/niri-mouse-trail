@@ -708,7 +708,7 @@ static void signal_handler(int sig) {
 int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
-    const char *device_path = "/dev/input/event2";
+    const char *device_path = NULL;
     const char *kbd_device_path = NULL;
     double cr=1.0,cg=1.0,cb=1.0,ca=1.0, width=8.0;
     uint64_t length_ms=500; double min_speed=2.0, smooth_factor=0.6;
@@ -773,22 +773,27 @@ int main(int argc, char *argv[]) {
 
     /* Open mouse devices — try configured path, then auto-detect all matching */
     {
-        int fd = open(device_path, O_RDONLY|O_NONBLOCK);
-        if (fd >= 0 && libevdev_new_from_fd(fd, &evdev[0]) == 0) {
-            num_mice = 1;
-            input_fd[0] = fd;
-            is_abs[0] = libevdev_has_event_type(evdev[0], EV_ABS) &&
-                        libevdev_has_event_code(evdev[0], EV_ABS, ABS_X) &&
-                        libevdev_has_event_code(evdev[0], EV_ABS, ABS_Y);
-            abs_has_pos[0] = 0;
-            abs_last_x[0]=0; abs_last_y[0]=0;
-            abs_pending_dx[0]=0; abs_pending_dy[0]=0;
-            LOG_INFO("Mouse: %s (%s)", libevdev_get_name(evdev[0]), device_path);
-        } else {
-            if (fd >= 0) close(fd);
-            LOG_INFO("Auto-detecting mouse devices");
-            char trypath[32];
-            for (int en = 0; en < 32 && num_mice < MAX_MICE; en++) {
+        /* Try configured device first */
+        if (device_path) {
+            int fd = open(device_path, O_RDONLY|O_NONBLOCK);
+            if (fd >= 0 && libevdev_new_from_fd(fd, &evdev[0]) == 0) {
+                num_mice = 1;
+                input_fd[0] = fd;
+                is_abs[0] = libevdev_has_event_type(evdev[0], EV_ABS) &&
+                            libevdev_has_event_code(evdev[0], EV_ABS, ABS_X) &&
+                            libevdev_has_event_code(evdev[0], EV_ABS, ABS_Y);
+                abs_has_pos[0] = 0;
+                abs_last_x[0]=0; abs_last_y[0]=0;
+                abs_pending_dx[0]=0; abs_pending_dy[0]=0;
+                LOG_INFO("Configured: %s (%s)", libevdev_get_name(evdev[0]), device_path);
+            } else {
+                if (fd >= 0) close(fd);
+            }
+        }
+
+        /* Always scan for additional/all devices */
+        char trypath[32];
+        for (int en = 0; en < 32 && num_mice < MAX_MICE; en++) {
                 snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
                 int tfd = open(trypath, O_RDONLY|O_NONBLOCK);
                 if (tfd < 0) continue;
@@ -855,7 +860,6 @@ int main(int argc, char *argv[]) {
             }
         }
         if (num_mice == 0) { LOG_ERROR("No mouse found"); return 1; }
-    }
 
     trail_init(&trail, width, length_ms, min_speed, smooth_factor, cr, cg, cb, ca);
 
