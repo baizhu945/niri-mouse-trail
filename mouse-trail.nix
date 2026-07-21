@@ -108,6 +108,7 @@ in
   systemd.user.services.mouse-trail-theme-sync = {
     Unit = {
       Description = "Sync noctalia theme color to mouse-trail on startup";
+      StartLimitIntervalSec = 0;
     };
     Service = {
       Type = "oneshot";
