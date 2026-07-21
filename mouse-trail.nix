@@ -36,6 +36,23 @@ let
     };
   };
 
+  theme-sync-script = pkgs.writeShellScriptBin "mouse-trail-sync-theme" ''
+    set -euo pipefail
+    SOCK="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/mouse-trail.sock"
+    # Retry until socket is ready (max 2s)
+    for i in $(seq 1 40); do
+        if [ -S "$SOCK" ]; then break; fi
+        sleep 0.05
+    done
+    if [ ! -S "$SOCK" ]; then exit 0; fi
+    COLORS_JSON="$HOME/.config/noctalia/colors.json"
+    if [ ! -f "$COLORS_JSON" ]; then exit 0; fi
+    THEME=$(${pkgs.jq}/bin/jq -r '.mPrimary' "$COLORS_JSON" | sed 's/^#//')
+    if [ -n "$THEME" ] && [ "$THEME" != "null" ]; then
+        ${mouse-trail-pkg}/bin/mouse-trail --ctl "color $THEME" 2>/dev/null || true
+    fi
+  '';
+
   toggle-script = pkgs.writeShellScriptBin "mouse-trail-toggle" ''
     set -euo pipefail
     PIDFILE="/tmp/mouse-trail.pid"
@@ -48,15 +65,6 @@ let
         remove-without-permission -f "$PIDFILE" "$SOCK"
         ${mouse-trail-pkg}/bin/mouse-trail &
         echo $! > "$PIDFILE"
-        sleep 0.1
-        # Sync theme color from noctalia
-        COLORS_JSON="$HOME/.config/noctalia/colors.json"
-        if [ -f "$COLORS_JSON" ]; then
-            THEME_COLOR=$(${pkgs.jq}/bin/jq -r '.mPrimary' "$COLORS_JSON" | sed 's/^#//')
-            if [ -n "$THEME_COLOR" ] && [ "$THEME_COLOR" != "null" ]; then
-                ${mouse-trail-pkg}/bin/mouse-trail --ctl "color $THEME_COLOR" 2>/dev/null || true
-            fi
-        fi
     fi
   '';
 
@@ -90,9 +98,32 @@ in
     mouse-trail-pkg
     toggle-script
     ctl-script
+    theme-sync-script
   ];
 
   home.file = {
     ".config/mouse-trail/config".source = ./config.example;
+  };
+
+  systemd.user.services.mouse-trail-theme-sync = {
+    Unit = {
+      Description = "Sync noctalia theme color to mouse-trail on startup";
+    };
+    Service = {
+      Type = "oneshot";
+      ExecStart = "${theme-sync-script}/bin/mouse-trail-sync-theme";
+    };
+  };
+
+  systemd.user.paths.mouse-trail-theme-sync = {
+    Unit = {
+      Description = "Watch for mouse-trail socket to trigger theme sync";
+    };
+    Install = {
+      WantedBy = [ "default.target" ];
+    };
+    Path = {
+      PathExists = [ "%t/mouse-trail.sock" ];
+    };
   };
 }
