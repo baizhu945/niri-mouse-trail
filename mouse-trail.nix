@@ -48,7 +48,7 @@ let
         remove-without-permission -f "$PIDFILE" "$SOCK"
         ${mouse-trail-pkg}/bin/mouse-trail &
         echo $! > "$PIDFILE"
-        sleep 0.5
+        sleep 0.1
         # Sync theme color from noctalia
         COLORS_JSON="$HOME/.config/noctalia/colors.json"
         if [ -f "$COLORS_JSON" ]; then
