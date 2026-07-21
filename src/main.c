@@ -841,15 +841,37 @@ int main(int argc, char *argv[]) {
                         libevdev_has_event_code(tdev, EV_ABS, ABS_Y))
                         is_absdev = 1;
                     if (is_mouse || is_absdev) {
-                        /* Dedup: if same phys has both REL and ABS, prefer ABS (touchpad) */
+                        /* Dedup: prefer REL, skip ABS if same phys already has REL */
                         const char *phys = libevdev_get_phys(tdev);
+                        if (phys && is_absdev) {
+                            int has_rel = 0;
+                            for (int m = 0; m < num_mice; m++)
+                                if (evdev[m] && libevdev_get_phys(evdev[m]) &&
+                                    strcmp(libevdev_get_phys(evdev[m]), phys) == 0 &&
+                                    !is_abs[m]) { has_rel = 1; break; }
+                            if (has_rel) { libevdev_free(tdev); close(tfd); continue; }
+                        }
                         if (phys && is_mouse) {
                             int has_abs = 0;
                             for (int m = 0; m < num_mice; m++)
                                 if (evdev[m] && libevdev_get_phys(evdev[m]) &&
                                     strcmp(libevdev_get_phys(evdev[m]), phys) == 0 &&
                                     is_abs[m]) { has_abs = 1; break; }
-                            if (has_abs) { libevdev_free(tdev); close(tfd); continue; }
+                            if (has_abs) {
+                                /* Replace ABS with REL */
+                                libevdev_free(evdev[m]); close(input_fd[m]);
+                                for (int k = m; k < num_mice - 1; k++) {
+                                    evdev[k] = evdev[k+1]; input_fd[k] = input_fd[k+1];
+                                    is_abs[k] = is_abs[k+1];
+                                    abs_last_x[k] = abs_last_x[k+1]; abs_last_y[k] = abs_last_y[k+1];
+                                    abs_has_pos[k] = abs_has_pos[k+1];
+                                    abs_pending_dx[k]=abs_pending_dx[k+1]; abs_pending_dy[k]=abs_pending_dy[k+1];
+                                    abs_total_dx[k]=abs_total_dx[k+1]; abs_total_dy[k]=abs_total_dy[k+1];
+                                    abs_scale_x[k]=abs_scale_x[k+1]; abs_scale_y[k]=abs_scale_y[k+1];
+                                    abs_calib_pos_x[k]=abs_calib_pos_x[k+1]; abs_calib_pos_y[k]=abs_calib_pos_y[k+1];
+                                }
+                                num_mice--;
+                            }
                         }
                         evdev[num_mice] = tdev;
                         input_fd[num_mice] = tfd;
@@ -877,33 +899,6 @@ int main(int argc, char *argv[]) {
             }
         }
         if (num_mice == 0) { LOG_ERROR("No mouse found"); return 1; }
-
-        /* Remove REL devices that have an ABS sibling (prevent double-track) */
-        for (int m = 0; m < num_mice; m++) {
-            if (is_abs[m]) continue;
-            const char *phys = libevdev_get_phys(evdev[m]);
-            if (!phys) continue;
-            for (int n = 0; n < num_mice; n++) {
-                if (n != m && is_abs[n] && libevdev_get_phys(evdev[n]) &&
-                    strcmp(libevdev_get_phys(evdev[n]), phys) == 0) {
-                    LOG_INFO("Dropping REL device #%d (ABS sibling #%d exists)", m, n);
-                    libevdev_free(evdev[m]); close(input_fd[m]);
-                    /* Shift remaining */
-                    for (int k = m; k < num_mice - 1; k++) {
-                        evdev[k] = evdev[k+1]; input_fd[k] = input_fd[k+1];
-                        is_abs[k] = is_abs[k+1];
-                        abs_last_x[k] = abs_last_x[k+1]; abs_last_y[k] = abs_last_y[k+1];
-                        abs_has_pos[k] = abs_has_pos[k+1];
-                        abs_pending_dx[k]=abs_pending_dx[k+1]; abs_pending_dy[k]=abs_pending_dy[k+1];
-                        abs_total_dx[k]=abs_total_dx[k+1]; abs_total_dy[k]=abs_total_dy[k+1];
-                        abs_scale_x[k]=abs_scale_x[k+1]; abs_scale_y[k]=abs_scale_y[k+1];
-                        abs_calib_pos_x[k]=abs_calib_pos_x[k+1]; abs_calib_pos_y[k]=abs_calib_pos_y[k+1];
-                    }
-                    num_mice--; m--;
-                    break;
-                }
-            }
-        }
     }
 
     trail_init(&trail, width, length_ms, min_speed, smooth_factor, cr, cg, cb, ca);
