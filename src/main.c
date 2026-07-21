@@ -68,6 +68,7 @@ static int abs_has_pos[MAX_MICE];
 static double abs_pending_dx[MAX_MICE];
 static double abs_pending_dy[MAX_MICE];
 static int num_mice = 0;
+static uint64_t last_point_ms = 0;   /* throttle: one trail point per device poll */
 static struct libevdev *kbd_evdev = NULL;
 static int kbd_fd = -1;
 static pthread_t input_thread, kbd_thread;
@@ -359,16 +360,18 @@ static void *input_thread_fn(void *arg) {
                             if (new_y < bounds_min_y) { trail.pos_y = bounds_min_y; }
                             else if (new_y > bounds_max_y) { trail.pos_y = bounds_max_y; }
                             else trail.pos_y = new_y;
-                            if (dx != 0.0 || dy != 0.0) {
+                            uint64_t now = get_time_ms();
+                            if (now - last_point_ms > 5) {
                                 int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
                                 trail.points[idx].x = trail.pos_x;
                                 trail.points[idx].y = trail.pos_y;
-                                trail.points[idx].timestamp_ms = get_time_ms();
+                                trail.points[idx].timestamp_ms = now;
                                 if (trail.count < MAX_TRAIL_POINTS) trail.count++;
                                 else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
-                                trail.stationary_start = 0;
-                                need_redraw = 1;
+                                last_point_ms = now;
                             }
+                            trail.stationary_start = 0;
+                            need_redraw = 1;
                         }
                         pthread_mutex_unlock(&input_mutex);
                     } else if (ev.type == EV_ABS && is_abs[m] &&
@@ -401,12 +404,16 @@ static void *input_thread_fn(void *arg) {
                             if (new_y < bounds_min_y) { trail.pos_y = bounds_min_y; }
                             else if (new_y > bounds_max_y) { trail.pos_y = bounds_max_y; }
                             else trail.pos_y = new_y;
-                            int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
-                            trail.points[idx].x = trail.pos_x;
-                            trail.points[idx].y = trail.pos_y;
-                            trail.points[idx].timestamp_ms = get_time_ms();
-                            if (trail.count < MAX_TRAIL_POINTS) trail.count++;
-                            else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
+                            uint64_t now = get_time_ms();
+                            if (now - last_point_ms > 5) {
+                                int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
+                                trail.points[idx].x = trail.pos_x;
+                                trail.points[idx].y = trail.pos_y;
+                                trail.points[idx].timestamp_ms = now;
+                                if (trail.count < MAX_TRAIL_POINTS) trail.count++;
+                                else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
+                                last_point_ms = now;
+                            }
                             trail.stationary_start = 0;
                             need_redraw = 1;
                             pthread_mutex_unlock(&input_mutex);
