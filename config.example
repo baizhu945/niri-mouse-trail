@@ -27,17 +27,5 @@ color_cycle=off
 # Color cycle period in seconds
 cycle_speed=5
 
-# Mouse input device
-# IMPORTANT: Use stable by-id or by-path symlinks to avoid event number drift.
-# `/dev/input/eventN` numbers change on reboot or device hotplug.
-# Find your stable paths:  ls /dev/input/by-id/*event-mouse*
-# Example: /dev/input/by-id/usb-MyMouse-event-mouse
-device=/dev/input/by-id/usb-ITON_Corp._Rapoo_NearLink_Mouse_335844C84037-event-mouse
-
-# Keyboard device for hotkey-based warp detection
-# Same as above - use stable by-id/by-path symlinks.
-# Find your stable paths:  ls /dev/input/by-id/*event-kbd*
-kbd_device=/dev/input/by-id/usb-SONiX_GS3108T-PRO-event-kbd
-
 # Import another config file
 #import=/path/to/theme.conf

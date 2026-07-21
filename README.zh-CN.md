@@ -139,8 +139,8 @@ mouse-trail --help
 
 选项：
   --config PATH       配置文件路径（默认：~/.config/mouse-trail/config）
-  --device PATH       输入设备（默认：/dev/input/event2）
-  --kbd-device PATH    键盘设备，用于快捷键检测（默认：/dev/input/event5）
+  --device PATH       输入设备（覆盖自动检测）
+  --kbd-device PATH    键盘设备（覆盖自动检测）
   --color RRGGBB      拖尾颜色（默认：ffffff）
   --alpha N           透明度 0-1（默认：1.0）
   --width N           头部半径（像素，默认：8）
@@ -171,8 +171,6 @@ min_speed=2
 smooth_factor=0.6
 color_cycle=off
 cycle_speed=5
-device=/dev/input/event2
-kbd_device=/dev/input/event5
 import=/path/to/theme.conf
 ```
 
@@ -259,7 +257,7 @@ Wayland 刻意阻止客户端查询全局光标位置。这是一项安全特性
 ## 架构
 
 ```
-/dev/input/event2 ──► 输入线程（libevdev，逐事件钳制）
+所有自动检测到的输入设备 ──► 输入线程（poll，逐事件钳制）
                            │
                      trail.pos_x, trail.pos_y
                      轨迹环形缓冲区（绝对全局坐标）

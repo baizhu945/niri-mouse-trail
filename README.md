@@ -141,8 +141,8 @@ mouse-trail --help
 
 Options:
   --config PATH       Config file (default: ~/.config/mouse-trail/config)
-  --device PATH       Input device (default: /dev/input/event2)
-  --kbd-device PATH    Keyboard for hotkey detection (default: /dev/input/event5)
+  --device PATH       Input device (overrides auto-detect)
+  --kbd-device PATH    Keyboard device (overrides auto-detect)
   --color RRGGBB      Trail color (default: ffffff)
   --alpha N           Opacity 0-1 (default: 1.0)
   --width N           Head radius in px (default: 8)
@@ -173,8 +173,6 @@ min_speed=2
 smooth_factor=0.6
 color_cycle=off
 cycle_speed=5
-device=/dev/input/event2
-kbd_device=/dev/input/event5
 import=/path/to/theme.conf
 ```
 
@@ -262,8 +260,8 @@ Only the 2px-thin hollow square receives pointer events. Everything inside and o
 ## Architecture
 
 ```
-/dev/input/event2 ──► Input Thread (libevdev, per-event clamping)
-/dev/input/event5 ──► Keyboard Thread (hotkey detection)
+┌─ Input Thread (poll() all detected mice/touchpads)
+├─ Keyboard Thread (hotkey detection, auto-detected)
                            │
                      trail.pos_x, trail.pos_y
                      trail ring buffer (absolute global coords)
@@ -339,8 +337,7 @@ Ensure your compositor uses `accel-profile "flat"` (no pointer acceleration). Th
 
 ### No trail visible
 
-1. Check the input device: `mouse-trail --device /dev/input/event2` (verify with `evtest`)
-2. Check logs: `mouse-trail --log-level debug --log-file /tmp/trail.log`
+1. Check the log: `mouse-trail --log-level debug --log-file /tmp/trail.log`
 3. Ensure the compositor supports `wlr-layer-shell-unstable-v1`
 
 ### Color cycling looks wrong

@@ -67,12 +67,6 @@ static double abs_last_y[MAX_MICE];
 static int abs_has_pos[MAX_MICE];
 static double abs_pending_dx[MAX_MICE];
 static double abs_pending_dy[MAX_MICE];
-static double abs_total_dx[MAX_MICE];   /* total ABS deltas since last calibration */
-static double abs_total_dy[MAX_MICE];
-static double abs_scale_x[MAX_MICE];    /* calibrated speed multiplier */
-static double abs_scale_y[MAX_MICE];
-static double abs_calib_pos_x[MAX_MICE]; /* compositor pos at last calibration */
-static double abs_calib_pos_y[MAX_MICE];
 static int num_mice = 0;
 static struct libevdev *kbd_evdev = NULL;
 static int kbd_fd = -1;
@@ -169,36 +163,14 @@ static void ptr_motion(void *d,struct wl_pointer *p,uint32_t t,wl_fixed_t sx,wl_
     double psx = wl_fixed_to_double(sx), psy = wl_fixed_to_double(sy);
     for (int i = 0; i < num_outputs; i++) {
         if (outputs[i].surface == current_pointer_surface) {
-            double real_x = outputs[i].global_x + psx;
-            double real_y = outputs[i].global_y + psy;
-            pthread_mutex_lock(&input_mutex);
-            /* Calibrate ABS scale: compute adjustment factor vs base prediction */
-            for (int m = 0; m < num_mice; m++) {
-                if (!is_abs[m]) continue;
-                int ax = libevdev_get_abs_maximum(evdev[m], ABS_X) - libevdev_get_abs_minimum(evdev[m], ABS_X);
-                int ay = libevdev_get_abs_maximum(evdev[m], ABS_Y) - libevdev_get_abs_minimum(evdev[m], ABS_Y);
-                double bx = (ax > 0 && outputs[0].width > 0) ? (double)outputs[0].width / (double)ax : 1.0;
-                double by = (ay > 0 && outputs[0].height > 0) ? (double)outputs[0].height / (double)ay : 1.0;
-                if (abs_calib_pos_x[m] != 0 && fabs(abs_total_dx[m]) > 10.0 && fabs(bx) > 0) {
-                    double predicted = abs_total_dx[m] * bx;
-                    abs_scale_x[m] = predicted != 0 ? (real_x - abs_calib_pos_x[m]) / predicted : 1.0;
-                }
-                if (abs_calib_pos_y[m] != 0 && fabs(abs_total_dy[m]) > 10.0 && fabs(by) > 0) {
-                    double predicted = abs_total_dy[m] * by;
-                    abs_scale_y[m] = predicted != 0 ? (real_y - abs_calib_pos_y[m]) / predicted : 1.0;
-                }
-                abs_calib_pos_x[m] = real_x;
-                abs_calib_pos_y[m] = real_y;
-                abs_total_dx[m] = 0;
-                abs_total_dy[m] = 0;
-            }
-            captured_cursor_x = real_x;
-            captured_cursor_y = real_y;
+            captured_cursor_x = outputs[i].global_x + psx;
+            captured_cursor_y = outputs[i].global_y + psy;
             cursor_captured = 1;
-            trail_set_position(&trail, real_x, real_y);
+            pthread_mutex_lock(&input_mutex);
+            trail_set_position(&trail, captured_cursor_x, captured_cursor_y);
             need_redraw = 1;
             pthread_mutex_unlock(&input_mutex);
-            LOG_DEBUG("Recalibrated via motion: global=(%.0f,%.0f)", real_x, real_y);
+            LOG_DEBUG("Recalibrated via motion: global=(%.0f,%.0f)", captured_cursor_x, captured_cursor_y);
             return;
         }
     }
@@ -408,8 +380,6 @@ static void *input_thread_fn(void *arg) {
                         else if (cur != *last) {
                             double delta = cur - *last;
                             *pending += delta;
-                            if (ev.code == ABS_X) abs_total_dx[m] += delta;
-                            else abs_total_dy[m] += delta;
                             *last = cur;
                         }
                     } else if (ev.type == EV_SYN && ev.code == SYN_REPORT && is_abs[m]) {
@@ -417,13 +387,11 @@ static void *input_thread_fn(void *arg) {
                         double dx = abs_pending_dx[m], dy = abs_pending_dy[m];
                         abs_pending_dx[m] = 0; abs_pending_dy[m] = 0;
                         if (dx != 0.0 || dy != 0.0) {
-                            /* Base: logical-pixel mapping. Ring calibration adjusts further. */
+                            /* Logical-pixel base mapping for ABS devices */
                             int ax = libevdev_get_abs_maximum(evdev[m], ABS_X) - libevdev_get_abs_minimum(evdev[m], ABS_X);
                             int ay = libevdev_get_abs_maximum(evdev[m], ABS_Y) - libevdev_get_abs_minimum(evdev[m], ABS_Y);
-                            double base_x = (ax > 0 && outputs[0].width > 0) ? (double)outputs[0].width / (double)ax : 0;
-                            double base_y = (ay > 0 && outputs[0].height > 0) ? (double)outputs[0].height / (double)ay : 0;
-                            if (base_x > 0 && abs_scale_x[m] > 0) dx *= base_x * abs_scale_x[m];
-                            if (base_y > 0 && abs_scale_y[m] > 0) dy *= base_y * abs_scale_y[m];
+                            if (ax > 0 && outputs[0].width > 0) dx = dx / (double)ax * (double)outputs[0].width;
+                            if (ay > 0 && outputs[0].height > 0) dy = dy / (double)ay * (double)outputs[0].height;
                             pthread_mutex_lock(&input_mutex);
                             double new_x = trail.pos_x + dx;
                             double new_y = trail.pos_y + dy;
@@ -815,9 +783,6 @@ int main(int argc, char *argv[]) {
             abs_has_pos[0] = 0;
             abs_last_x[0]=0; abs_last_y[0]=0;
             abs_pending_dx[0]=0; abs_pending_dy[0]=0;
-            abs_total_dx[0]=0; abs_total_dy[0]=0;
-            abs_scale_x[0]=1.0; abs_scale_y[0]=1.0;
-            abs_calib_pos_x[0]=0; abs_calib_pos_y[0]=0;
             LOG_INFO("Mouse: %s (%s)", libevdev_get_name(evdev[0]), device_path);
         } else {
             if (fd >= 0) close(fd);
@@ -841,34 +806,31 @@ int main(int argc, char *argv[]) {
                         libevdev_has_event_code(tdev, EV_ABS, ABS_Y))
                         is_absdev = 1;
                     if (is_mouse || is_absdev) {
-                        /* Dedup: prefer REL, skip ABS if same phys already has REL */
+                        /* Dedup: prefer ABS for same phys (REL interface may be silent) */
                         const char *phys = libevdev_get_phys(tdev);
-                        if (phys && is_absdev) {
-                            int has_rel = 0;
-                            for (int m = 0; m < num_mice; m++)
-                                if (evdev[m] && libevdev_get_phys(evdev[m]) &&
-                                    strcmp(libevdev_get_phys(evdev[m]), phys) == 0 &&
-                                    !is_abs[m]) { has_rel = 1; break; }
-                            if (has_rel) { libevdev_free(tdev); close(tfd); continue; }
-                        }
                         if (phys && is_mouse) {
                             int has_abs = 0;
                             for (int m = 0; m < num_mice; m++)
                                 if (evdev[m] && libevdev_get_phys(evdev[m]) &&
                                     strcmp(libevdev_get_phys(evdev[m]), phys) == 0 &&
                                     is_abs[m]) { has_abs = 1; break; }
-                            if (has_abs) {
-                                /* Replace ABS with REL */
-                                libevdev_free(evdev[m]); close(input_fd[m]);
-                                for (int k = m; k < num_mice - 1; k++) {
+                            if (has_abs) { libevdev_free(tdev); close(tfd); continue; }
+                        }
+                        if (phys && is_absdev) {
+                            int has_rel = 0, rel_idx = -1;
+                            for (int m = 0; m < num_mice; m++)
+                                if (evdev[m] && libevdev_get_phys(evdev[m]) &&
+                                    strcmp(libevdev_get_phys(evdev[m]), phys) == 0 &&
+                                    !is_abs[m]) { has_rel = 1; rel_idx = m; break; }
+                            if (has_rel) {
+                                /* Replace silent REL with ABS */
+                                libevdev_free(evdev[rel_idx]); close(input_fd[rel_idx]);
+                                for (int k = rel_idx; k < num_mice - 1; k++) {
                                     evdev[k] = evdev[k+1]; input_fd[k] = input_fd[k+1];
                                     is_abs[k] = is_abs[k+1];
                                     abs_last_x[k] = abs_last_x[k+1]; abs_last_y[k] = abs_last_y[k+1];
                                     abs_has_pos[k] = abs_has_pos[k+1];
                                     abs_pending_dx[k]=abs_pending_dx[k+1]; abs_pending_dy[k]=abs_pending_dy[k+1];
-                                    abs_total_dx[k]=abs_total_dx[k+1]; abs_total_dy[k]=abs_total_dy[k+1];
-                                    abs_scale_x[k]=abs_scale_x[k+1]; abs_scale_y[k]=abs_scale_y[k+1];
-                                    abs_calib_pos_x[k]=abs_calib_pos_x[k+1]; abs_calib_pos_y[k]=abs_calib_pos_y[k+1];
                                 }
                                 num_mice--;
                             }
@@ -881,12 +843,6 @@ int main(int argc, char *argv[]) {
                         abs_has_pos[num_mice] = 0;
                         abs_pending_dx[num_mice] = 0;
                         abs_pending_dy[num_mice] = 0;
-                        abs_total_dx[num_mice] = 0;
-                        abs_total_dy[num_mice] = 0;
-                        abs_scale_x[num_mice] = 1.0;
-                        abs_scale_y[num_mice] = 1.0;
-                        abs_calib_pos_x[num_mice] = 0;
-                        abs_calib_pos_y[num_mice] = 0;
                         LOG_INFO("Auto-detected %s #%d: %s (%s)",
                                  is_mouse ? "mouse" : "touchpad",
                                  num_mice, libevdev_get_name(tdev), trypath);
