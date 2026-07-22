@@ -27,5 +27,8 @@ color_cycle=off
 # Color cycle period in seconds
 cycle_speed=5
 
+# Trail style: comet (continuous line) or dots (individual circles)
+trail_style=comet
+
 # Import another config file
 #import=/path/to/theme.conf

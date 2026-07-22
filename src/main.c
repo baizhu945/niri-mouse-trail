@@ -83,6 +83,7 @@ static int outputs_locked = 0;   /* set after initial setup, triggers restart on
 
 static int color_cycle_on = 0;
 static double cycle_speed = 5.0;
+static int trail_style_comet = 1;   /* 1=comet line, 0=dots */
 
 /* Screen bounds for cursor clamping */
 static double bounds_min_x = 0, bounds_min_y = 0;
@@ -267,11 +268,29 @@ static struct wl_buffer *create_shm_buffer(int w, int h, void **data_out, int *s
     return b;
 }
 
+typedef struct { cairo_t *cr; double px, py; int has; } comet_ctx_t;
+
 static void draw_trail_point(void *user, double x, double y, double radius,
     double alpha, double r, double g, double b) {
-    cairo_t *cr = (cairo_t*)user;
-    cairo_save(cr); cairo_set_source_rgba(cr, r, g, b, alpha);
-    cairo_arc(cr, x, y, radius, 0.0, 2.0*M_PI); cairo_fill(cr); cairo_restore(cr);
+    comet_ctx_t *ctx = (comet_ctx_t*)user;
+    if (trail_style_comet) {
+        if (!ctx->has) { ctx->px = x; ctx->py = y; ctx->has = 1; return; }
+        cairo_save(ctx->cr);
+        cairo_set_source_rgba(ctx->cr, r, g, b, alpha);
+        cairo_set_line_width(ctx->cr, radius * 2.0);
+        cairo_set_line_cap(ctx->cr, CAIRO_LINE_CAP_ROUND);
+        cairo_move_to(ctx->cr, ctx->px, ctx->py);
+        cairo_line_to(ctx->cr, x, y);
+        cairo_stroke(ctx->cr);
+        cairo_restore(ctx->cr);
+        ctx->px = x; ctx->py = y;
+    } else {
+        cairo_save(ctx->cr);
+        cairo_set_source_rgba(ctx->cr, r, g, b, alpha);
+        cairo_arc(ctx->cr, x, y, radius, 0.0, 2.0*M_PI);
+        cairo_fill(ctx->cr);
+        cairo_restore(ctx->cr);
+    }
 }
 
 static void render_output(output_t *out) {
@@ -284,7 +303,8 @@ static void render_output(output_t *out) {
     cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR); cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_translate(cr, -(double)out->global_x, -(double)out->global_y);
-    trail_render(&trail, get_time_ms(), draw_trail_point, cr);
+    comet_ctx_t ctx = { cr, 0, 0, 0 };
+    trail_render(&trail, get_time_ms(), draw_trail_point, &ctx);
     cairo_destroy(cr); cairo_surface_destroy(cs);
     wl_surface_attach(out->surface, buf, 0, 0);
     wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
@@ -658,7 +678,7 @@ static int config_include_count = 0;
 static void parse_config(const char *path,
     double *cr, double *cg, double *cb, double *ca,
     double *width, uint64_t *length_ms, double *min_speed, double *smooth_factor,
-    int *color_cycle_on, double *cycle_speed,
+    int *color_cycle_on, double *cycle_speed, int *trail_style_comet,
     const char **device, const char **kbd_device) {
     if (config_include_count >= MAX_CONFIG_INCLUDES) return;
     config_include_count++;
@@ -677,7 +697,7 @@ static void parse_config(const char *path,
         while (*key && (key[strlen(key)-1]==' '||key[strlen(key)-1]=='\t')) key[strlen(key)-1]='\0';
         while (*val == ' ' || *val == '\t') val++;
 
-        if (strcmp(key, "import") == 0) { parse_config(val, cr, cg, cb, ca, width, length_ms, min_speed, smooth_factor, color_cycle_on, cycle_speed, device, kbd_device); }
+        if (strcmp(key, "import") == 0) { parse_config(val, cr, cg, cb, ca, width, length_ms, min_speed, smooth_factor, color_cycle_on, cycle_speed, trail_style_comet, device, kbd_device); }
         else if (strcmp(key, "color") == 0) { unsigned int ri,gi,bi; const char *cv = val; if (*cv=='#') cv++; if(sscanf(cv,"%02x%02x%02x",&ri,&gi,&bi)==3){ *cr=ri/255.0;*cg=gi/255.0;*cb=bi/255.0; } }
         else if (strcmp(key, "alpha") == 0) *ca = atof(val);
         else if (strcmp(key, "width") == 0) *width = atof(val);
@@ -688,6 +708,7 @@ static void parse_config(const char *path,
         else if (strcmp(key, "cycle_speed") == 0) *cycle_speed = atof(val);
         else if (strcmp(key, "device") == 0) { *device = strdup(val); }
         else if (strcmp(key, "kbd_device") == 0) { *kbd_device = strdup(val); }
+        else if (strcmp(key, "trail_style") == 0) { *trail_style_comet = (strcmp(val, "comet") == 0); }
     }
     fclose(f);
 }
@@ -762,7 +783,7 @@ int main(int argc, char *argv[]) {
     /* Save CLI values before config overrides */
     const char *cli_device = device_path;
     const char *cli_kbd = kbd_device_path;
-    parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms, &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed, &device_path, &kbd_device_path);
+    parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms, &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed, &trail_style_comet, &device_path, &kbd_device_path);
     /* CLI values take priority over config */
     if (cli_device && strcmp(cli_device, "/dev/input/event2") != 0) device_path = cli_device;
     if (cli_kbd) kbd_device_path = cli_kbd;
