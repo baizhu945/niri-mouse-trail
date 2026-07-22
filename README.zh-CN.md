@@ -50,6 +50,7 @@
 ## 特性
 
 - **流星尾迹**：头部亮且宽，尾部随 t³ 渐隐、(1−t)² 渐细
+- **两种视觉风格**：流畅彗星线（默认）或离散渐隐小球（可配置）
 - **多显示器**：为每个输出创建独立的 layer surface
 - **实时控制**：通过 Unix socket 实时切换颜色、宽度、透明度、速度
 - **HSL 彩虹循环**：连续彩虹色拖尾，可调节循环速度
@@ -171,6 +172,7 @@ min_speed=2
 smooth_factor=0.6
 color_cycle=off
 cycle_speed=5
+trail_style=comet
 import=/path/to/theme.conf
 ```
 

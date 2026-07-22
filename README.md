@@ -52,6 +52,7 @@ Before using mouse-trail, ensure your system meets these prerequisites:
 ## Features
 
 - **Meteor-like trail**: head is bright and wide, tail fades cubically and tapers quadratically
+- **Two visual styles**: smooth comet-line (default) or discrete fading dots (configurable)
 - **Multi-monitor**: creates independent layer surfaces for each output
 - **Real-time control**: change color, width, opacity, speed via Unix socket
 - **HSL color cycling**: continuous rainbow trail with configurable cycle speed
@@ -173,6 +174,7 @@ min_speed=2
 smooth_factor=0.6
 color_cycle=off
 cycle_speed=5
+trail_style=comet
 import=/path/to/theme.conf
 ```
 
