@@ -278,7 +278,8 @@ static void draw_trail_point(void *user, double x, double y, double radius,
         cairo_save(ctx->cr);
         cairo_set_source_rgba(ctx->cr, r, g, b, alpha);
         cairo_set_line_width(ctx->cr, radius * 2.0);
-        cairo_set_line_cap(ctx->cr, CAIRO_LINE_CAP_ROUND);
+        cairo_set_line_cap(ctx->cr, CAIRO_LINE_CAP_BUTT);
+        cairo_set_line_join(ctx->cr, CAIRO_LINE_JOIN_ROUND);
         cairo_move_to(ctx->cr, ctx->px, ctx->py);
         cairo_line_to(ctx->cr, x, y);
         cairo_stroke(ctx->cr);
