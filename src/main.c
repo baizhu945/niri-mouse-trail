@@ -69,8 +69,9 @@ static double abs_pending_dx[MAX_MICE];
 static double abs_pending_dy[MAX_MICE];
 static int num_mice = 0;
 static uint64_t last_point_ms = 0;   /* throttle: one trail point per device poll */
-static struct libevdev *kbd_evdev = NULL;
-static int kbd_fd = -1;
+static struct libevdev *kbd_evdev[MAX_MICE];
+static int kbd_fd[MAX_MICE];
+static int num_kbd = 0;
 static pthread_t input_thread, kbd_thread;
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -612,13 +613,20 @@ static void detect_warp_bindings(void) {
 /* Keyboard monitor: detect monitor-switch hotkeys and trigger warp */
 static void *kbd_thread_fn(void *arg) {
     (void)arg;
-    if (!kbd_evdev) return NULL;
     int super_down = 0, shift_down = 0, ctrl_down = 0, alt_down = 0;
     uint64_t last_warp_trigger = 0;
     struct input_event ev;
+    struct pollfd fds[MAX_MICE];
+    for (int k = 0; k < num_kbd; k++) {
+        fds[k].fd = kbd_fd[k];
+        fds[k].events = POLLIN;
+    }
     while (running) {
-        int rc = libevdev_next_event(kbd_evdev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_KEY) {
+        int ready = poll(fds, num_kbd, 100);
+        if (ready < 0) break;
+        for (int k = 0; k < num_kbd; k++) {
+            if (!(fds[k].revents & POLLIN)) continue;
+            while (libevdev_next_event(kbd_evdev[k], LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
             int pressed = (ev.value == 1);
             int released = (ev.value == 0);
             switch (ev.code) {
@@ -655,8 +663,8 @@ static void *kbd_thread_fn(void *arg) {
                     }
                     break;
             }
-        } else if (rc == -EAGAIN) { usleep(500); }
-        else if (rc < 0 && rc != -ENODEV) break;
+        }
+    }
     }
     return NULL;
 }
@@ -789,8 +797,8 @@ int main(int argc, char *argv[]) {
     if (cli_device && strcmp(cli_device, "/dev/input/event2") != 0) device_path = cli_device;
     if (cli_kbd) kbd_device_path = cli_kbd;
 
-    /* Default keyboard device for hotkey detection */
-    if (!kbd_device_path) kbd_device_path = "/dev/input/event5";
+    /* Default keyboard device — NULL means auto-detect */
+    /* (no default, NULL triggers auto-detect below) */
 
     if (log_path && strcmp(log_path,"-")!=0 && ctl_cmd==NULL) { FILE *f=fopen(log_path,"a"); if(f)log_init(f,log_level); else{log_init(stderr,log_level);LOG_ERROR("Cannot open: %s",log_path);} }
     else log_init(stderr, log_level);
@@ -892,14 +900,25 @@ int main(int argc, char *argv[]) {
 
     trail_init(&trail, width, length_ms, min_speed, smooth_factor, cr, cg, cb, ca);
 
-    /* Open keyboard device for hotkey monitoring */
-    kbd_fd = open(kbd_device_path, O_RDONLY|O_NONBLOCK);
-    if (kbd_fd < 0 || libevdev_new_from_fd(kbd_fd, &kbd_evdev) < 0) {
-        if (kbd_fd >= 0) { close(kbd_fd); kbd_fd = -1; }
-        LOG_WARN("Cannot open keyboard %s, auto-detecting", kbd_device_path);
+    /* Open keyboard devices — config + auto-detect */
+    {
+        /* Try configured device first */
+        if (kbd_device_path) {
+            int fd = open(kbd_device_path, O_RDONLY|O_NONBLOCK);
+            if (fd >= 0 && libevdev_new_from_fd(fd, &kbd_evdev[0]) == 0) {
+                num_kbd = 1;
+                kbd_fd[0] = fd;
+                LOG_INFO("Keyboard: %s (%s)", libevdev_get_name(kbd_evdev[0]), kbd_device_path);
+            } else {
+                if (fd >= 0) close(fd);
+            }
+        }
+
+        /* Auto-detect all keyboard devices */
         char trypath[32];
-        for (int en = 0; en < 32 && !kbd_evdev; en++) {
+        for (int en = 0; en < 32 && num_kbd < MAX_MICE; en++) {
             snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
+            if (kbd_device_path && strcmp(trypath, kbd_device_path) == 0) continue;
             int tfd = open(trypath, O_RDONLY|O_NONBLOCK);
             if (tfd < 0) continue;
             struct libevdev *tdev = NULL;
@@ -907,18 +926,17 @@ int main(int argc, char *argv[]) {
                 if (libevdev_has_event_type(tdev, EV_KEY) &&
                     libevdev_has_event_code(tdev, EV_KEY, KEY_A) &&
                     libevdev_has_event_code(tdev, EV_KEY, KEY_ESC)) {
-                    kbd_fd = tfd;
-                    kbd_evdev = tdev;
-                    LOG_INFO("Auto-detected keyboard: %s (%s)", libevdev_get_name(kbd_evdev), trypath);
-                    break;
+                    kbd_evdev[num_kbd] = tdev;
+                    kbd_fd[num_kbd] = tfd;
+                    LOG_INFO("Auto-detected keyboard #%d: %s (%s)", num_kbd, libevdev_get_name(tdev), trypath);
+                    num_kbd++;
+                    continue;
                 }
                 libevdev_free(tdev);
             }
             close(tfd);
         }
-        if (!kbd_evdev) LOG_WARN("No keyboard found, warp hotkey detection disabled");
-    } else {
-        LOG_INFO("Keyboard: %s (%s)", libevdev_get_name(kbd_evdev), kbd_device_path);
+        if (num_kbd == 0) LOG_WARN("No keyboard found, warp hotkey detection disabled");
     }
 
     display = wl_display_connect(NULL);
@@ -997,7 +1015,7 @@ int main(int argc, char *argv[]) {
     setup_control_socket(socket_path);
     start_time_ms = get_time_ms();
     pthread_create(&input_thread, NULL, input_thread_fn, NULL);
-    if (kbd_evdev) {
+    if (num_kbd > 0) {
         detect_warp_bindings();
         pthread_create(&kbd_thread, NULL, kbd_thread_fn, NULL);
     }
@@ -1072,7 +1090,7 @@ int main(int argc, char *argv[]) {
     LOG_INFO("Shutting down");
     wl_display_roundtrip(display);
     pthread_cancel(input_thread); pthread_join(input_thread, NULL);
-    if (kbd_evdev) { pthread_cancel(kbd_thread); pthread_join(kbd_thread, NULL); }
+    if (num_kbd > 0) { pthread_cancel(kbd_thread); pthread_join(kbd_thread, NULL); }
     for(int i=0;i<num_outputs;i++){ if(outputs[i].layer_surface)zwlr_layer_surface_v1_destroy(outputs[i].layer_surface); if(outputs[i].surface)wl_surface_destroy(outputs[i].surface); if(outputs[i].wl_output)wl_output_destroy(outputs[i].wl_output); }
     if(pointer) wl_pointer_destroy(pointer);
     if(seat) wl_seat_destroy(seat);
@@ -1082,8 +1100,7 @@ int main(int argc, char *argv[]) {
     if(registry) wl_registry_destroy(registry);
     if(display) wl_display_disconnect(display);
     for(int m=0; m<num_mice; m++){ if(evdev[m]) libevdev_free(evdev[m]); if(input_fd[m] >= 0) close(input_fd[m]); }
-    if(kbd_evdev) libevdev_free(kbd_evdev);
-    if(kbd_fd >= 0) close(kbd_fd);
+    for (int k = 0; k < num_kbd; k++) { if (kbd_evdev[k]) libevdev_free(kbd_evdev[k]); if (kbd_fd[k] >= 0) close(kbd_fd[k]); }
     if(ctrl_fd >= 0) { close(ctrl_fd); unlink(socket_path); }
     if(timer_fd >= 0) close(timer_fd);
     if(g_log_file && g_log_file != stderr) fclose(g_log_file);
