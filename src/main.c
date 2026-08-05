@@ -185,6 +185,33 @@ static const struct wl_pointer_listener pointer_listener = {
     .enter=ptr_enter,.leave=ptr_leave,.motion=ptr_motion,.button=ptr_button,.axis=ptr_axis,.frame=ptr_frame,
 };
 
+/* Restart the trail after the current process exits.
+ * Used for monitor-switch detection and hotplug: the child waits until the
+ * parent has fully exited (releasing the control socket / layer surfaces),
+ * then records its own PID (unchanged across exec) in the pidfile so the
+ * toggle script can still manage the instance, and execs a fresh instance
+ * directly. This avoids the toggle-script race where a still-alive process
+ * gets killed without a replacement being started, and removes the fixed
+ * 1s sleep of the old restart path. */
+static void restart_after_exit(void) {
+    pid_t parent = getppid();
+    for (int i = 0; i < 200 && getppid() == parent; i++) usleep(25000); /* max 5s */
+    FILE *pf = fopen("/tmp/mouse-trail.pid", "w");
+    if (pf) { fprintf(pf, "%d\n", (int)getpid()); fclose(pf); }
+    /* The replacement inherits this process's stdio. If we were started from
+     * a terminal / shell pipe (e.g. during testing), that fd dies when the
+     * parent shell exits, and the fresh instance would be killed by SIGPIPE
+     * on its first log write. Detach stdio so the replacement survives. */
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+    }
+    execlp("mouse-trail", "mouse-trail", NULL);
+    _exit(1);
+}
+
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
     const char *interface, uint32_t version) {
     (void)data;(void)version;
@@ -198,7 +225,7 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
         if (num_outputs < MAX_OUTPUTS) {
             if (outputs_locked && running) {
                 LOG_INFO("New output detected (hotplug), restarting");
-                if (fork() == 0) { sleep(1); execlp("mouse-trail-toggle","mouse-trail-toggle",NULL); _exit(1); }
+                if (fork() == 0) restart_after_exit();
                 running = 0;
                 return;
             }
@@ -333,13 +360,8 @@ static void handle_control_msg(const char *msg) {
     else if (strcmp(msg,"show")==0) { trail.visible=true; need_redraw=1; }
     else if (strcmp(msg,"hide")==0) { trail.visible=false; need_redraw=1; }
     else if (strcmp(msg,"warp")==0) {
-        LOG_INFO("Warp command: restarting trail");
-        if (fork() == 0) {
-            sleep(1);
-            execlp("mouse-trail-toggle", "mouse-trail-toggle", NULL);
-            execlp("mouse-trail", "mouse-trail", NULL);
-            _exit(1);
-        }
+        LOG_INFO("Warp command: restarting trail for recapture");
+        if (fork() == 0) restart_after_exit();
         running = 0;
     }
 }
@@ -524,9 +546,11 @@ static void detect_warp_bindings(void) {
         while (fgets(line, sizeof(line), f) && num_warp_bindings < MAX_WARP_BINDINGS) {
             /* Check for known monitor-switch action keywords */
             if (strstr(line, "focus-monitor-left") || strstr(line, "focus-monitor-right") ||
+                strstr(line, "focus-monitor-up") || strstr(line, "focus-monitor-down") ||
                 strstr(line, "focus output left") || strstr(line, "focus output right") ||
                 strstr(line, "movefocus, monitor") ||
                 strstr(line, "move-column-to-monitor-left") || strstr(line, "move-column-to-monitor-right") ||
+                strstr(line, "move-column-to-monitor-up") || strstr(line, "move-column-to-monitor-down") ||
                 strstr(line, "move workspace to output left") || strstr(line, "move workspace to output right")) {
 
                 warp_binding_t wb;
@@ -649,13 +673,8 @@ static void *kbd_thread_fn(void *arg) {
                                 ctrl_down  == wb->need_ctrl &&
                                 alt_down   == wb->need_alt) {
                                 last_warp_trigger = get_time_ms();
-                                LOG_INFO("Warp hotkey detected (key=%d), restarting trail", ev.code);
-                                if (fork() == 0) {
-                                    sleep(1);
-                                    execlp("mouse-trail-toggle", "mouse-trail-toggle", NULL);
-                                    execlp("mouse-trail", "mouse-trail", NULL);
-                                    _exit(1);
-                                }
+                                LOG_INFO("Monitor-switch hotkey detected (key=%d), restarting trail for recapture", ev.code);
+                                if (fork() == 0) restart_after_exit();
                                 running = 0;
                                 break;
                             }
