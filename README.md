@@ -129,11 +129,11 @@ mouse-trail-ctl color-cycle on      # Enable HSL rainbow cycling
 mouse-trail-ctl color-cycle off     # Disable
 mouse-trail-ctl show                # Show trail
 mouse-trail-ctl hide                # Hide trail
-mouse-trail-ctl warp                # Trigger full-screen recapture
+mouse-trail-ctl warp                # Manually trigger restart+recapture (handled automatically by hotkey detection; rarely needed)
 mouse-trail-ctl help                # Show all commands with defaults
 ```
 
-> **Monitor-switch tracking is automatic.** The program monitors keyboard events (Super+Shift+Left/Right, Super+Shift+Ctrl+Left/Right) and automatically restarts with full calibration on screen switches. No extra hotkey binding needed.
+> **Monitor-switch tracking is automatic.** The program monitors the keyboard via raw evdev devices (Super+Shift+Left/Right, Super+Shift+Ctrl+Left/Right, etc. — independent of whether the mouse is hidden) and restarts itself on detection. The fresh instance has a 5-second full-surface capture window — even if the cursor is invisible due to niri's auto-hide (`hide-after-inactive-ms`, default 5 s idle), moving the mouse (which wakes the cursor) within that window recalibrates immediately.
 
 ### CLI options
 
@@ -216,8 +216,8 @@ Wayland intentionally prevents clients from querying the global cursor position.
 **Our hybrid approach:**
 - **Continuous tracking**: raw evdev events processed per-event with screen-edge clamping (same behavior as the compositor)
 - **Startup calibration**: full-surface `wl_pointer` capture during first 5 seconds of operation
-- **Drift correction**: cross-shaped calibration lines provide periodic absolute position ground-truth from the compositor, eliminating integration drift
-- **Monitor-switch detection**: keyboard hotkey monitoring (Super+Shift+Left/Right) triggers automatic restart with full recalibration
+- **Drift correction**: ring calibration lines provide periodic absolute position ground-truth from the compositor, eliminating integration drift
+- **Monitor-switch handling**: the teleport lands in the ring's hollow, so the ring cannot catch it directly; the keyboard hotkey monitor (evdev, independent of cursor visibility) triggers an automatic restart whose 5-second full-surface window recaptures the cursor. This covers niri's auto-hide (`hide-after-inactive-ms 5000`) case, where the hidden cursor emits no `wl_pointer` events
 
 This is the best achievable solution within Wayland's security constraints — we cannot query the cursor position directly, so we combine evdev tracking with opportunistic compositor calibration.
 
@@ -249,11 +249,11 @@ Only the 2px-thin hollow square receives pointer events. Everything inside and o
 - **Inner open area**: 196×196 px (center is completely free)
 - **Total active area**: ~1592 px² — less than 0.12% of a 1440×900 surface
 
-**Why a ring?** A closed loop guarantees calibration: to leave the center area in ANY direction, the cursor MUST cross the ring. Unlike a cross pattern, there are no "gaps" to slip through. The center 196×196 area is completely open — UI elements placed at screen center are never blocked.
+**Why a ring?** A closed loop guarantees calibration: to leave the center area in ANY direction, the cursor MUST cross the ring. The center 196×196 area is completely open — UI elements placed at screen center are never blocked.
 
 **Why calibration?** The trail tracks cursor position by integrating velocity from raw evdev events (speed → position). Digital integration inherently accumulates floating-point error over time. When the cursor crosses the ring, `wl_pointer` provides an absolute position ground-truth from the compositor, instantly correcting any accumulated drift.
 
-**Monitor-switch detection** is handled separately by monitoring keyboard hotkeys (Super+Shift+Left/Right). A detected screen switch triggers an automatic restart with full-surface calibration.
+**Monitor-switch tracking.** niri's `focus-monitor-*` actions teleport the cursor to the target monitor's exact center — which falls in the ring's hollow, so the ring cannot catch the teleport directly. The program therefore monitors the keyboard via raw evdev devices (independent of cursor visibility) and restarts itself on detection: the fresh instance's 5-second full-surface capture window catches the cursor. This solves the niri auto-hide case (`hide-after-inactive-ms 5000`, cursor disappears after 5 s idle) where the hidden cursor emits no `wl_pointer` events — the ring sees nothing, but keyboard hotkey detection always works. The restart waits for the old process to fully exit before starting the replacement (`restart_after_exit`), avoiding the old toggle-script race where a still-alive process was killed without a replacement, and correctly rewrites the pidfile so `mouse-trail-toggle` stays consistent.
 
 ### Why 5-second full surface at startup? The initial full-surface window guarantees the cursor position is captured immediately when the trail is first enabled, even if the cursor is stationary. After capture, the bullseye handles subsequent warps.
 
@@ -331,7 +331,7 @@ The original author's NixOS configuration includes automatic theme synchronizati
 
 ### Trail appears at wrong position
 
-This can happen when the compositor doesn't send `wl_pointer.enter` at startup (common on niri). The trail initializes at the primary output center. Move the cursor across the screen center (crossing the calibration crosshair) — this will instantly recalibrate the position. Monitor-switch hotkeys (Super+Shift+Left/Right) automatically restart with full calibration.
+This can happen when the compositor doesn't send `wl_pointer.enter` at startup (common on niri). The trail initializes at the primary output center. Move the cursor across the screen center (crossing the calibration ring) — this will instantly recalibrate the position. After a monitor switch the program restarts automatically and recaptures via the 5-second full-surface window; if still misaligned, move the mouse across the calibration ring.
 
 ### Trail lags behind cursor
 

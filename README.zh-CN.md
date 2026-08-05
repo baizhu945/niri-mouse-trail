@@ -11,7 +11,7 @@
 >
 > **请在进入游戏前运行 `mouse-trail-toggle` 关闭拖尾，游戏结束后再次运行开启。**
 >
-> This project uses a **cross-shaped calibration region** (tiny crosshair lines at screen center) for periodic cursor position correction.
+> This project uses a **ring-shaped calibration region** (a 2px-thin hollow square at screen center) for periodic cursor position correction.
 > While only ~1592 px² (<0.12% of screen), it may **block mouse clicks at the screen center in fullscreen games** (FPS, MOBA, etc.).
 >
 > **Run `mouse-trail-toggle` to disable the trail before gaming, and again to re-enable after.**
@@ -127,11 +127,11 @@ mouse-trail-ctl color-cycle on      # 开启 HSL 彩虹循环
 mouse-trail-ctl color-cycle off     # 关闭
 mouse-trail-ctl show                # 显示拖尾
 mouse-trail-ctl hide                # 隐藏拖尾
-mouse-trail-ctl warp                # 触发全屏重捕获
+mouse-trail-ctl warp                # 手动触发重启重捕获（跳屏热键已自动处理，一般无需使用）
 mouse-trail-ctl help                # 显示所有命令及默认值
 ```
 
-> **跳屏追踪是全自动的。** 程序会监听键盘事件（Super+Shift+Left/Right、Super+Shift+Ctrl+Left/Right），在屏幕切换时自动重启并进行全表面校准，无需额外绑定快捷键。
+> **跳屏追踪是全自动的。** 程序通过 evdev 键盘设备监听跳屏快捷键（Super+Shift+Left/Right、Super+Shift+Ctrl+Left/Right 等，与鼠标是否隐藏无关），检测到后自动重启进程。新实例拥有 5 秒全表面捕获窗口——即使鼠标此前因 niri 的自动隐藏（`hide-after-inactive-ms`，默认 5 秒无操作）而不可见，只要在窗口内移动鼠标（会唤醒光标），即可立即校准位置。
 
 ### 命令行选项
 
@@ -214,7 +214,7 @@ Wayland 刻意阻止客户端查询全局光标位置。这是一项安全特性
 **我们的混合方案：**
 - **持续追踪**：逐事件处理原始 evdev 事件，配合屏幕边缘钳制（与合成器行为一致）
 - **启动校准**：前 5 秒全表面 `wl_pointer` 捕获
-- **漂移纠正**：十字校准线周期性从合成器获取绝对位置基准
+- **漂移纠正**：环形校准线周期性从合成器获取绝对位置基准
 
 这是在 Wayland 安全约束下的最优解——我们无法直接查询光标位置，因此将 evdev 追踪与合成器校准机会相结合。
 
@@ -246,11 +246,11 @@ Wayland 刻意阻止客户端查询全局光标位置。这是一项安全特性
 - **内部开放区**：196×196 px（正中心完全自由）
 - **总激活面积**：约 1592 px² — 不到 1440×900 表面的 0.12%
 
-**为什么是环？** 闭环保证校准：从中心区域向任意方向离开，必然穿过环线。与十字不同，环没有"缝隙"可以滑过。同时中心 196×196 区域完全开放——屏幕正中的 UI 元素永远不会被阻挡。
+**为什么是环？** 闭环保证校准：从中心区域向任意方向离开，必然穿过环线。同时中心 196×196 区域完全开放——屏幕正中的 UI 元素永远不会被阻挡。
 
 **为什么需要校准？** 拖尾通过积分 evdev 原始事件的速度来追踪光标位置（速度 → 位移）。数字积分天然存在浮点误差，长时间运行后误差会累积。当光标穿过环形校准线时，`wl_pointer` 从合成器获取绝对位置基准，瞬间消除累积漂移。
 
-**显示器跳转检测** 由独立的键盘监听线程处理（Super+Shift+Left/Right），检测到跳屏后自动重启程序并进行全表面校准，不再依赖输入区域。
+**跳屏（monitor switch）追踪。** niri 的 `focus-monitor-*` 会把光标瞬间传送到目标屏幕**正中央**——恰好落在环的空洞里，环无法直接捕获这次传送。因此程序通过 evdev 键盘设备监听跳屏快捷键（与鼠标是否隐藏无关），检测到后自动重启进程：新实例的 5 秒全表面捕获窗口会抓住鼠标位置。这解决了 niri 自动隐藏鼠标（`hide-after-inactive-ms 5000`，5 秒无操作后光标消失）导致的校准失效——鼠标隐藏期间 niri 不发送 `wl_pointer` 事件，环检测不到任何东西，而键盘热键检测始终可用。重启采用"等旧进程完全退出后再启动新实例"的方式（`restart_after_exit`），避免旧方案中 toggle 脚本"杀掉进程却不重启"的竞态，且新实例 PID 会正确写入 pidfile，与 `mouse-trail-toggle` 交互一致。
 
 **为什么启动时需要 5 秒全表面？** 初始全表面窗口保证在拖尾首次启用时立即捕获光标位置，即使光标处于静止状态。捕获后由环形校准线处理后续漂移纠正。
 
@@ -328,7 +328,7 @@ mouse-trail/
 
 ### 拖尾出现在错误位置
 
-这发生在合成器启动时未发送 `wl_pointer.enter` 事件的情况（niri 上较常见）。拖尾会初始化在主显示器中心。将光标移动到任意屏幕边缘——边界钳制会自动将拖尾位置校正到正确位置。
+这发生在合成器启动时未发送 `wl_pointer.enter` 事件的情况（niri 上较常见）。拖尾会初始化在主显示器中心。将光标移动到任意屏幕边缘——边界钳制会自动将拖尾位置校正到正确位置。跳屏后程序会自动重启并利用 5 秒全表面窗口重新校准；若仍未校准，移动鼠标穿过屏幕中央的校准环即可。
 
 ### 拖尾滞后于光标
 
