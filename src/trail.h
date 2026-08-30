@@ -7,7 +7,7 @@
 #define MAX_TRAIL_POINTS 1024
 
 typedef struct {
-    double x, y;          // offset from current cursor position
+    double x, y;          // absolute global coordinates
     uint64_t timestamp_ms;
 } trail_point_t;
 
@@ -39,7 +39,7 @@ int trail_cleanup(trail_state_t *t, uint64_t now_ms);
 typedef void (*trail_render_cb)(void *user, double x, double y,
                                  double radius, double alpha,
                                  double r, double g, double b);
-int trail_render(trail_state_t *t, uint64_t now_ms,
+int trail_render(const trail_state_t *t, uint64_t now_ms,
                   trail_render_cb cb, void *user);
 
 void trail_set_color(trail_state_t *t, double r, double g, double b, double a);

@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <linux/input.h>
 
 FILE *g_log_file = NULL;
@@ -34,6 +35,7 @@ typedef struct {
     struct zwlr_layer_surface_v1 *layer_surface;
     int global_x, global_y;
     int width, height;       /* logical surface dimensions */
+    int cursor_width, cursor_height; /* niri cursor layout dimensions */
     int phys_w, phys_h;      /* physical pixel dimensions from mode */
     double scale;
     int configured;
@@ -77,8 +79,9 @@ static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int ctrl_fd = -1;
 static int timer_fd = -1;
-static int running = 1;
-static int need_redraw = 0;
+static _Atomic int running = 1;
+static _Atomic int need_redraw = 0;
+static _Atomic int restart_requested = 0;
 static int center_region_set = 0;
 static int outputs_locked = 0;   /* set after initial setup, triggers restart on new outputs */
 
@@ -86,9 +89,125 @@ static int color_cycle_on = 0;
 static double cycle_speed = 5.0;
 static int trail_style_comet = 1;   /* 1=comet line, 0=dots */
 
-/* Screen bounds for cursor clamping */
-static double bounds_min_x = 0, bounds_min_y = 0;
-static double bounds_max_x = 0, bounds_max_y = 0;
+static int point_in_output(const output_t *out, double x, double y) {
+    int width = out->cursor_width > 0 ? out->cursor_width : out->width;
+    int height = out->cursor_height > 0 ? out->cursor_height : out->height;
+    if (out->removed || !out->configured || out->width <= 0 || out->height <= 0)
+        return 0;
+    return x >= (double)out->global_x &&
+           x < (double)out->global_x + (double)width &&
+           y >= (double)out->global_y &&
+           y < (double)out->global_y + (double)height;
+}
+
+static int point_in_any_output(double x, double y) {
+    for (int i = 0; i < num_outputs; i++)
+        if (point_in_output(&outputs[i], x, y)) return 1;
+    return 0;
+}
+
+/* Keep an edge-clamped estimate infinitesimally inside its output. The
+ * compositor permits moving back from an edge, while a strict half-open
+ * rectangle would otherwise make the next inward event look invalid too. */
+static int nudge_position_inside_outputs(double *x, double *y) {
+    if (point_in_any_output(*x, *y)) return 1;
+    for (int i = 0; i < num_outputs; i++) {
+        output_t *out = &outputs[i];
+        int width = out->cursor_width > 0 ? out->cursor_width : out->width;
+        int height = out->cursor_height > 0 ? out->cursor_height : out->height;
+        double left = out->global_x, right = left + width;
+        double top = out->global_y, bottom = top + height;
+        if (out->removed || !out->configured || width <= 0 || height <= 0 ||
+            *x < left || *x > right || *y < top || *y > bottom)
+            continue;
+        if (*x >= right) *x = nextafter(right, left);
+        if (*y >= bottom) *y = nextafter(bottom, top);
+        if (point_in_any_output(*x, *y)) return 1;
+    }
+    return 0;
+}
+
+static int clip_axis(double origin, double delta, double min, double max,
+                     double *lo, double *hi) {
+    if (fabs(delta) < 1e-12)
+        return origin >= min && origin < max;
+
+    double a = (min - origin) / delta;
+    double b = (max - origin) / delta;
+    if (a > b) { double tmp = a; a = b; b = tmp; }
+    if (a > *lo) *lo = a;
+    if (b < *hi) *hi = b;
+    return *lo <= *hi + 1e-12;
+}
+
+/* Return the furthest point along a motion segment that remains in the
+ * connected union of output rectangles. A single bounding box is wrong for
+ * monitors with different heights: it permits motion through the gap below
+ * the shorter monitor. */
+static double reachable_output_fraction(double x0, double y0,
+                                         double x1, double y1) {
+    if (!point_in_any_output(x0, y0)) return 0.0;
+
+    double dx = x1 - x0, dy = y1 - y0;
+    double reachable = 0.0;
+    for (int pass = 0; pass < MAX_OUTPUTS; pass++) {
+        double next = reachable;
+        for (int i = 0; i < num_outputs; i++) {
+            output_t *out = &outputs[i];
+            if (out->removed || !out->configured || out->width <= 0 || out->height <= 0)
+                continue;
+            int cursor_width = out->cursor_width > 0 ? out->cursor_width : out->width;
+            int cursor_height = out->cursor_height > 0 ? out->cursor_height : out->height;
+            double lo = 0.0, hi = 1.0;
+            if (!clip_axis(x0, dx, out->global_x, out->global_x + cursor_width, &lo, &hi) ||
+                !clip_axis(y0, dy, out->global_y, out->global_y + cursor_height, &lo, &hi))
+                continue;
+            if (lo <= reachable + 1e-9 && hi > next) next = hi;
+        }
+        if (next <= reachable + 1e-9) break;
+        reachable = next;
+    }
+    if (reachable < 0.0) return 0.0;
+    if (reachable > 1.0) return 1.0;
+    return reachable;
+}
+
+static void append_trail_point_locked(uint64_t now) {
+    if (now - last_point_ms <= 5) return;
+    int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
+    trail.points[idx].x = trail.pos_x;
+    trail.points[idx].y = trail.pos_y;
+    trail.points[idx].timestamp_ms = now;
+    if (trail.count < MAX_TRAIL_POINTS) trail.count++;
+    else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
+    last_point_ms = now;
+}
+
+static void apply_cursor_delta_locked(double dx, double dy, uint64_t now) {
+    if (dx == 0.0 && dy == 0.0) return;
+
+    double x0 = trail.pos_x, y0 = trail.pos_y;
+    if (!nudge_position_inside_outputs(&x0, &y0)) return;
+    trail.pos_x = x0;
+    trail.pos_y = y0;
+    double fraction = reachable_output_fraction(x0, y0, x0 + dx, y0 + dy);
+    double nx = x0 + dx * fraction;
+    double ny = y0 + dy * fraction;
+    if (!point_in_any_output(nx, ny)) {
+        double backoff = 1e-6 / fmax(1.0, fmax(fabs(dx), fabs(dy)));
+        fraction = fraction > backoff ? fraction - backoff : 0.0;
+        nx = x0 + dx * fraction;
+        ny = y0 + dy * fraction;
+        if (!nudge_position_inside_outputs(&nx, &ny)) return;
+    }
+    if (fabs(nx - x0) < 1e-12 && fabs(ny - y0) < 1e-12) return;
+
+    trail.pos_x = nx;
+    trail.pos_y = ny;
+    append_trail_point_locked(now);
+    trail.stationary_start = 0;
+    atomic_store(&need_redraw, 1);
+}
 
 static uint64_t get_time_ms(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -185,31 +304,17 @@ static const struct wl_pointer_listener pointer_listener = {
     .enter=ptr_enter,.leave=ptr_leave,.motion=ptr_motion,.button=ptr_button,.axis=ptr_axis,.frame=ptr_frame,
 };
 
-/* Restart the trail after the current process exits.
- * Used for monitor-switch detection and hotplug: the child waits until the
- * parent has fully exited (releasing the control socket / layer surfaces),
- * then records its own PID (unchanged across exec) in the pidfile so the
- * toggle script can still manage the instance, and execs a fresh instance
- * directly. This avoids the toggle-script race where a still-alive process
- * gets killed without a replacement being started, and removes the fixed
- * 1s sleep of the old restart path. */
-static void restart_after_exit(void) {
-    pid_t parent = getppid();
-    for (int i = 0; i < 200 && getppid() == parent; i++) usleep(25000); /* max 5s */
-    FILE *pf = fopen("/tmp/mouse-trail.pid", "w");
-    if (pf) { fprintf(pf, "%d\n", (int)getpid()); fclose(pf); }
-    /* The replacement inherits this process's stdio. If we were started from
-     * a terminal / shell pipe (e.g. during testing), that fd dies when the
-     * parent shell exits, and the fresh instance would be killed by SIGPIPE
-     * on its first log write. Detach stdio so the replacement survives. */
-    int devnull = open("/dev/null", O_WRONLY);
-    if (devnull >= 0) {
-        dup2(devnull, STDOUT_FILENO);
-        dup2(devnull, STDERR_FILENO);
-        close(devnull);
+/* Workers only request a restart. The main thread performs the complete
+ * Wayland/input cleanup and then execs the original command line. Forking a
+ * multithreaded process and calling stdio/exec helpers in the child can
+ * deadlock, and execing without closing descriptors leaks every input fd. */
+static void request_restart(const char *reason) {
+    if (atomic_exchange(&restart_requested, 1)) {
+        atomic_store(&running, 0);
+        return;
     }
-    execlp("mouse-trail", "mouse-trail", NULL);
-    _exit(1);
+    LOG_INFO("Restart requested: %s", reason);
+    atomic_store(&running, 0);
 }
 
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
@@ -224,9 +329,7 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
     else if (strcmp(interface, wl_output_interface.name) == 0) {
         if (num_outputs < MAX_OUTPUTS) {
             if (outputs_locked && running) {
-                LOG_INFO("New output detected (hotplug), restarting");
-                if (fork() == 0) restart_after_exit();
-                running = 0;
+                request_restart("new output detected");
                 return;
             }
             struct wl_output *o = wl_registry_bind(reg, name, &wl_output_interface, 3);
@@ -259,10 +362,18 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *s,
     for (int i = 0; i < num_outputs; i++)
         if (outputs[i].layer_surface == s) {
             outputs[i].width=(int)w; outputs[i].height=(int)h; outputs[i].configured=1;
+            outputs[i].cursor_width=(int)w; outputs[i].cursor_height=(int)h;
             if (outputs[i].phys_w > 0 && w > 0)
                 outputs[i].scale = (double)outputs[i].phys_w / (double)w;
+            if (outputs[i].phys_w > 0 && outputs[i].phys_h > 0 && outputs[i].scale > 0.0) {
+                /* niri's cursor layout uses the floor of physical/scale,
+                 * while layer-shell may round the surface size upward. */
+                outputs[i].cursor_width = (int)floor(outputs[i].phys_w / outputs[i].scale + 1e-6);
+                outputs[i].cursor_height = (int)floor(outputs[i].phys_h / outputs[i].scale + 1e-6);
+            }
             LOG_INFO("Output %d: logical=%dx%d phys=%dx%d scale=%.2f",
-                     i, (int)w, (int)h, outputs[i].phys_w, outputs[i].phys_h, outputs[i].scale);
+                     i, outputs[i].cursor_width, outputs[i].cursor_height,
+                     outputs[i].phys_w, outputs[i].phys_h, outputs[i].scale);
             return;
         }
 }
@@ -322,7 +433,7 @@ static void draw_trail_point(void *user, double x, double y, double radius,
     }
 }
 
-static void render_output(output_t *out) {
+static void render_output(output_t *out, const trail_state_t *state) {
     if (out->removed || out->width <= 0 || out->height <= 0 || !out->configured) return;
     void *data; int stride;
     struct wl_buffer *buf = create_shm_buffer(out->width, out->height, &data, &stride);
@@ -333,7 +444,7 @@ static void render_output(output_t *out) {
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_translate(cr, -(double)out->global_x, -(double)out->global_y);
     comet_ctx_t ctx = { cr, 0, 0, 0 };
-    trail_render(&trail, get_time_ms(), draw_trail_point, &ctx);
+    trail_render(state, get_time_ms(), draw_trail_point, &ctx);
     cairo_destroy(cr); cairo_surface_destroy(cs);
     wl_surface_attach(out->surface, buf, 0, 0);
     wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
@@ -343,7 +454,11 @@ static void render_output(output_t *out) {
 }
 
 static void render_all(void) {
-    for (int i = 0; i < num_outputs; i++) render_output(&outputs[i]);
+    trail_state_t snapshot;
+    pthread_mutex_lock(&input_mutex);
+    snapshot = trail;
+    pthread_mutex_unlock(&input_mutex);
+    for (int i = 0; i < num_outputs; i++) render_output(&outputs[i], &snapshot);
 }
 
 static void handle_control_msg(const char *msg) {
@@ -360,15 +475,13 @@ static void handle_control_msg(const char *msg) {
     else if (strcmp(msg,"show")==0) { trail.visible=true; need_redraw=1; }
     else if (strcmp(msg,"hide")==0) { trail.visible=false; need_redraw=1; }
     else if (strcmp(msg,"warp")==0) {
-        LOG_INFO("Warp command: restarting trail for recapture");
-        if (fork() == 0) restart_after_exit();
-        running = 0;
+        request_restart("manual warp command");
     }
 }
 
 static void setup_control_socket(const char *path) {
     unlink(path);
-    ctrl_fd = socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK, 0);
+    ctrl_fd = socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
     if (ctrl_fd < 0) return;
     struct sockaddr_un addr; memset(&addr,0,sizeof(addr)); addr.sun_family=AF_UNIX;
     { size_t len = strlen(path); if (len >= sizeof(addr.sun_path)) len = sizeof(addr.sun_path)-1;
@@ -377,98 +490,86 @@ static void setup_control_socket(const char *path) {
     if (listen(ctrl_fd,5)<0) { close(ctrl_fd); ctrl_fd=-1; return; }
 }
 
+static void process_input_event(int m, const struct input_event *ev) {
+    if (ev->type == EV_REL && !is_abs[m] &&
+        (ev->code == REL_X || ev->code == REL_Y)) {
+        double dx = (ev->code == REL_X) ? (double)ev->value : 0.0;
+        double dy = (ev->code == REL_Y) ? (double)ev->value : 0.0;
+        pthread_mutex_lock(&input_mutex);
+        apply_cursor_delta_locked(dx, dy, get_time_ms());
+        pthread_mutex_unlock(&input_mutex);
+    } else if (ev->type == EV_ABS && is_abs[m] &&
+               (ev->code == ABS_X || ev->code == ABS_Y)) {
+        double *last = (ev->code == ABS_X) ? &abs_last_x[m] : &abs_last_y[m];
+        double *pending = (ev->code == ABS_X) ? &abs_pending_dx[m] : &abs_pending_dy[m];
+        double cur = (double)ev->value;
+        if (!abs_has_pos[m]) { *last = cur; abs_has_pos[m] = 1; }
+        else if (cur != *last) {
+            *pending += cur - *last;
+            *last = cur;
+        }
+    } else if (ev->type == EV_SYN && ev->code == SYN_REPORT && is_abs[m]) {
+        /* Apply accumulated ABS deltas on SYN_REPORT, scaled to logical px. */
+        double dx = abs_pending_dx[m], dy = abs_pending_dy[m];
+        abs_pending_dx[m] = 0;
+        abs_pending_dy[m] = 0;
+        int ax = libevdev_get_abs_maximum(evdev[m], ABS_X) -
+                 libevdev_get_abs_minimum(evdev[m], ABS_X);
+        int ay = libevdev_get_abs_maximum(evdev[m], ABS_Y) -
+                 libevdev_get_abs_minimum(evdev[m], ABS_Y);
+        if (ax > 0 && outputs[0].width > 0)
+            dx = dx / (double)ax * (double)outputs[0].width;
+        if (ay > 0 && outputs[0].height > 0)
+            dy = dy / (double)ay * (double)outputs[0].height;
+        pthread_mutex_lock(&input_mutex);
+        apply_cursor_delta_locked(dx, dy, get_time_ms());
+        pthread_mutex_unlock(&input_mutex);
+    } else if (ev->type == EV_KEY && is_abs[m] &&
+               ev->code == BTN_TOUCH && ev->value == 0) {
+        abs_has_pos[m] = 0;
+        abs_pending_dx[m] = 0;
+        abs_pending_dy[m] = 0;
+    }
+}
+
+static void drain_mouse_device(int m) {
+    struct input_event ev;
+    for (;;) {
+        int rc = libevdev_next_event(evdev[m], LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+            process_input_event(m, &ev);
+            continue;
+        }
+        if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+            LOG_WARN("Input queue overrun on device #%d; resynchronizing", m);
+            do {
+                rc = libevdev_next_event(evdev[m], LIBEVDEV_READ_FLAG_SYNC, &ev);
+                if (rc == LIBEVDEV_READ_STATUS_SYNC) process_input_event(m, &ev);
+            } while (rc == LIBEVDEV_READ_STATUS_SYNC);
+            if (rc == LIBEVDEV_READ_STATUS_SUCCESS) continue;
+        }
+        if (rc != -EAGAIN && rc != -EINTR && rc != -ENODEV)
+            LOG_WARN("Input device #%d stopped: %s", m, strerror(-rc));
+        return;
+    }
+}
+
 static void *input_thread_fn(void *arg) {
     (void)arg;
-    struct input_event ev;
     struct pollfd fds[MAX_MICE];
     for (int m = 0; m < num_mice; m++) {
         fds[m].fd = input_fd[m];
         fds[m].events = POLLIN;
     }
-    while (running) {
+    while (atomic_load(&running)) {
         int ready = poll(fds, num_mice, 50);
-        if (ready < 0) break;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
         for (int m = 0; m < num_mice; m++) {
-            if (!(fds[m].revents & POLLIN)) continue;
-            while (libevdev_next_event(evdev[m], LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
-                    if (ev.type == EV_REL && (ev.code == REL_X || ev.code == REL_Y)) {
-                        pthread_mutex_lock(&input_mutex);
-                        double dx = (ev.code == REL_X) ? (double)ev.value : 0.0;
-                        double dy = (ev.code == REL_Y) ? (double)ev.value : 0.0;
-                        if (dx != 0.0 || dy != 0.0) {
-                            double new_x = trail.pos_x + dx;
-                            double new_y = trail.pos_y + dy;
-                            if (new_x < bounds_min_x) { trail.pos_x = bounds_min_x; }
-                            else if (new_x > bounds_max_x) { trail.pos_x = bounds_max_x; }
-                            else trail.pos_x = new_x;
-                            if (new_y < bounds_min_y) { trail.pos_y = bounds_min_y; }
-                            else if (new_y > bounds_max_y) { trail.pos_y = bounds_max_y; }
-                            else trail.pos_y = new_y;
-                            uint64_t now = get_time_ms();
-                            if (now - last_point_ms > 5) {
-                                int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
-                                trail.points[idx].x = trail.pos_x;
-                                trail.points[idx].y = trail.pos_y;
-                                trail.points[idx].timestamp_ms = now;
-                                if (trail.count < MAX_TRAIL_POINTS) trail.count++;
-                                else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
-                                last_point_ms = now;
-                            }
-                            trail.stationary_start = 0;
-                            need_redraw = 1;
-                        }
-                        pthread_mutex_unlock(&input_mutex);
-                    } else if (ev.type == EV_ABS && is_abs[m] &&
-                               (ev.code == ABS_X || ev.code == ABS_Y)) {
-                        double *last = (ev.code == ABS_X) ? &abs_last_x[m] : &abs_last_y[m];
-                        double *pending = (ev.code == ABS_X) ? &abs_pending_dx[m] : &abs_pending_dy[m];
-                        double cur = (double)ev.value;
-                        if (!abs_has_pos[m]) { *last = cur; abs_has_pos[m] = 1; }
-                        else if (cur != *last) {
-                            double delta = cur - *last;
-                            *pending += delta;
-                            *last = cur;
-                        }
-                    } else if (ev.type == EV_SYN && ev.code == SYN_REPORT && is_abs[m]) {
-                        /* Apply accumulated ABS deltas on SYN_REPORT, scaled to screen px */
-                        double dx = abs_pending_dx[m], dy = abs_pending_dy[m];
-                        abs_pending_dx[m] = 0; abs_pending_dy[m] = 0;
-                        if (dx != 0.0 || dy != 0.0) {
-                            /* Logical-pixel base mapping for ABS devices */
-                            int ax = libevdev_get_abs_maximum(evdev[m], ABS_X) - libevdev_get_abs_minimum(evdev[m], ABS_X);
-                            int ay = libevdev_get_abs_maximum(evdev[m], ABS_Y) - libevdev_get_abs_minimum(evdev[m], ABS_Y);
-                            if (ax > 0 && outputs[0].width > 0) dx = dx / (double)ax * (double)outputs[0].width;
-                            if (ay > 0 && outputs[0].height > 0) dy = dy / (double)ay * (double)outputs[0].height;
-                            pthread_mutex_lock(&input_mutex);
-                            double new_x = trail.pos_x + dx;
-                            double new_y = trail.pos_y + dy;
-                            if (new_x < bounds_min_x) { trail.pos_x = bounds_min_x; }
-                            else if (new_x > bounds_max_x) { trail.pos_x = bounds_max_x; }
-                            else trail.pos_x = new_x;
-                            if (new_y < bounds_min_y) { trail.pos_y = bounds_min_y; }
-                            else if (new_y > bounds_max_y) { trail.pos_y = bounds_max_y; }
-                            else trail.pos_y = new_y;
-                            uint64_t now = get_time_ms();
-                            if (now - last_point_ms > 5) {
-                                int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
-                                trail.points[idx].x = trail.pos_x;
-                                trail.points[idx].y = trail.pos_y;
-                                trail.points[idx].timestamp_ms = now;
-                                if (trail.count < MAX_TRAIL_POINTS) trail.count++;
-                                else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
-                                last_point_ms = now;
-                            }
-                            trail.stationary_start = 0;
-                            need_redraw = 1;
-                            pthread_mutex_unlock(&input_mutex);
-                        }
-                    } else if (ev.type == EV_KEY && is_abs[m] &&
-                               ev.code == BTN_TOUCH && ev.value == 0) {
-                        abs_has_pos[m] = 0;
-                        abs_pending_dx[m] = 0;
-                        abs_pending_dy[m] = 0;
-                    }
-                }
+            if (fds[m].revents & (POLLIN | POLLERR | POLLHUP))
+                drain_mouse_device(m);
         }
     }
     return NULL;
@@ -634,62 +735,90 @@ static void detect_warp_bindings(void) {
     }
 }
 
-/* Keyboard monitor: detect monitor-switch hotkeys and trigger warp */
+static void process_key_event(const struct input_event *ev, int *super_down,
+                               int *shift_down, int *ctrl_down, int *alt_down) {
+    if (ev->type != EV_KEY) return;
+    int pressed = ev->value == 1;
+    int released = ev->value == 0;
+    switch (ev->code) {
+        case KEY_LEFTMETA: case KEY_RIGHTMETA:
+            if (pressed) *super_down = 1; else if (released) *super_down = 0;
+            break;
+        case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT:
+            if (pressed) *shift_down = 1; else if (released) *shift_down = 0;
+            break;
+        case KEY_LEFTCTRL: case KEY_RIGHTCTRL:
+            if (pressed) *ctrl_down = 1; else if (released) *ctrl_down = 0;
+            break;
+        case KEY_LEFTALT: case KEY_RIGHTALT:
+            if (pressed) *alt_down = 1; else if (released) *alt_down = 0;
+            break;
+        default:
+            if (!pressed) break;
+            for (int i = 0; i < num_warp_bindings; i++) {
+                warp_binding_t *wb = &warp_bindings[i];
+                if (ev->code == wb->key_code &&
+                    *super_down == wb->need_super &&
+                    *shift_down == wb->need_shift &&
+                    *ctrl_down  == wb->need_ctrl &&
+                    *alt_down   == wb->need_alt) {
+                    request_restart("monitor-switch hotkey");
+                    return;
+                }
+            }
+            break;
+    }
+}
+
+static void drain_keyboard_device(int k, int *super_down, int *shift_down,
+                                  int *ctrl_down, int *alt_down) {
+    struct input_event ev;
+    for (;;) {
+        int rc = libevdev_next_event(kbd_evdev[k], LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+            process_key_event(&ev, super_down, shift_down, ctrl_down, alt_down);
+            continue;
+        }
+        if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+            LOG_WARN("Keyboard queue overrun on device #%d; resynchronizing", k);
+            do {
+                rc = libevdev_next_event(kbd_evdev[k], LIBEVDEV_READ_FLAG_SYNC, &ev);
+                if (rc == LIBEVDEV_READ_STATUS_SYNC)
+                    process_key_event(&ev, super_down, shift_down, ctrl_down, alt_down);
+            } while (rc == LIBEVDEV_READ_STATUS_SYNC);
+            if (rc == LIBEVDEV_READ_STATUS_SUCCESS) continue;
+        }
+        if (rc != -EAGAIN && rc != -EINTR && rc != -ENODEV)
+            LOG_WARN("Keyboard device #%d stopped: %s", k, strerror(-rc));
+        return;
+    }
+}
+
+/* Keyboard monitor: detect monitor-switch hotkeys and trigger recapture. */
 static void *kbd_thread_fn(void *arg) {
     (void)arg;
     int super_down = 0, shift_down = 0, ctrl_down = 0, alt_down = 0;
-    uint64_t last_warp_trigger = 0;
-    struct input_event ev;
     struct pollfd fds[MAX_MICE];
     for (int k = 0; k < num_kbd; k++) {
         fds[k].fd = kbd_fd[k];
         fds[k].events = POLLIN;
     }
-    while (running) {
+    while (atomic_load(&running)) {
         int ready = poll(fds, num_kbd, 100);
-        if (ready < 0) break;
-        for (int k = 0; k < num_kbd; k++) {
-            if (!(fds[k].revents & POLLIN)) continue;
-            while (libevdev_next_event(kbd_evdev[k], LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
-            int pressed = (ev.value == 1);
-            int released = (ev.value == 0);
-            switch (ev.code) {
-                case KEY_LEFTMETA: case KEY_RIGHTMETA:
-                    if (pressed) super_down = 1; else if (released) super_down = 0; break;
-                case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT:
-                    if (pressed) shift_down = 1; else if (released) shift_down = 0; break;
-                case KEY_LEFTCTRL: case KEY_RIGHTCTRL:
-                    if (pressed) ctrl_down = 1; else if (released) ctrl_down = 0; break;
-                case KEY_LEFTALT: case KEY_RIGHTALT:
-                    if (pressed) alt_down = 1; else if (released) alt_down = 0; break;
-                default:
-                    if (pressed && get_time_ms() - last_warp_trigger > 1000) {
-                        /* Check against all detected warp bindings */
-                        for (int i = 0; i < num_warp_bindings; i++) {
-                            warp_binding_t *wb = &warp_bindings[i];
-                            if (ev.code == wb->key_code &&
-                                super_down == wb->need_super &&
-                                shift_down == wb->need_shift &&
-                                ctrl_down  == wb->need_ctrl &&
-                                alt_down   == wb->need_alt) {
-                                last_warp_trigger = get_time_ms();
-                                LOG_INFO("Monitor-switch hotkey detected (key=%d), restarting trail for recapture", ev.code);
-                                if (fork() == 0) restart_after_exit();
-                                running = 0;
-                                break;
-                            }
-                        }
-                    }
-                    break;
-            }
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
         }
-    }
+        for (int k = 0; k < num_kbd; k++) {
+            if (fds[k].revents & (POLLIN | POLLERR | POLLHUP))
+                drain_keyboard_device(k, &super_down, &shift_down, &ctrl_down, &alt_down);
+        }
     }
     return NULL;
 }
 
 static int send_control_cmd(const char *sock, const char *cmd) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
     if (fd < 0) return 1;
     struct sockaddr_un addr; memset(&addr,0,sizeof(addr)); addr.sun_family=AF_UNIX;
     { size_t len = strlen(sock); if (len >= sizeof(addr.sun_path)) len = sizeof(addr.sun_path)-1;
@@ -831,11 +960,15 @@ int main(int argc, char *argv[]) {
     {
         /* Try configured device first */
         if (device_path) {
-            int fd = open(device_path, O_RDONLY|O_NONBLOCK);
+            int fd = open(device_path, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
             if (fd >= 0 && libevdev_new_from_fd(fd, &evdev[0]) == 0) {
                 num_mice = 1;
                 input_fd[0] = fd;
-                is_abs[0] = libevdev_has_event_type(evdev[0], EV_ABS) &&
+                int has_rel = libevdev_has_event_type(evdev[0], EV_REL) &&
+                              libevdev_has_event_code(evdev[0], EV_REL, REL_X) &&
+                              libevdev_has_event_code(evdev[0], EV_REL, REL_Y);
+                is_abs[0] = !has_rel &&
+                            libevdev_has_event_type(evdev[0], EV_ABS) &&
                             libevdev_has_event_code(evdev[0], EV_ABS, ABS_X) &&
                             libevdev_has_event_code(evdev[0], EV_ABS, ABS_Y);
                 abs_has_pos[0] = 0;
@@ -851,7 +984,7 @@ int main(int argc, char *argv[]) {
         char trypath[32];
         for (int en = 0; en < 32 && num_mice < MAX_MICE; en++) {
                 snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
-                int tfd = open(trypath, O_RDONLY|O_NONBLOCK);
+                int tfd = open(trypath, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
                 if (tfd < 0) continue;
                 struct libevdev *tdev = NULL;
                 if (libevdev_new_from_fd(tfd, &tdev) == 0) {
@@ -866,8 +999,12 @@ int main(int argc, char *argv[]) {
                         libevdev_has_event_code(tdev, EV_ABS, ABS_X) &&
                         libevdev_has_event_code(tdev, EV_ABS, ABS_Y))
                         is_absdev = 1;
+                    /* A mixed REL+ABS node is treated as REL. This avoids
+                     * integrating two coordinate streams from composite HID
+                     * devices; pure ABS nodes remain a fallback for touchpads. */
+                    if (is_mouse && is_absdev) is_absdev = 0;
                     if (is_mouse || is_absdev) {
-                        /* Dedup: prefer ABS for same phys (REL interface may be silent) */
+                        /* Dedup pure ABS siblings when a REL interface exists. */
                         const char *phys = libevdev_get_phys(tdev);
                         if (phys && is_mouse) {
                             int has_abs = 0;
@@ -923,7 +1060,7 @@ int main(int argc, char *argv[]) {
     {
         /* Try configured device first */
         if (kbd_device_path) {
-            int fd = open(kbd_device_path, O_RDONLY|O_NONBLOCK);
+            int fd = open(kbd_device_path, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
             if (fd >= 0 && libevdev_new_from_fd(fd, &kbd_evdev[0]) == 0) {
                 num_kbd = 1;
                 kbd_fd[0] = fd;
@@ -938,7 +1075,7 @@ int main(int argc, char *argv[]) {
         for (int en = 0; en < 32 && num_kbd < MAX_MICE; en++) {
             snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
             if (kbd_device_path && strcmp(trypath, kbd_device_path) == 0) continue;
-            int tfd = open(trypath, O_RDONLY|O_NONBLOCK);
+            int tfd = open(trypath, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
             if (tfd < 0) continue;
             struct libevdev *tdev = NULL;
             if (libevdev_new_from_fd(tfd, &tdev) == 0) {
@@ -981,20 +1118,8 @@ int main(int argc, char *argv[]) {
         wl_surface_commit(o->surface); }
     wl_display_roundtrip(display); wl_display_roundtrip(display);
 
-    /* Compute cursor bounds from LOGICAL surface dimensions */
-    { bounds_min_x = bounds_max_x = bounds_min_y = bounds_max_y = 0;
-      for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
-        double l = o->global_x, r = o->global_x + (double)o->width;
-        double t = o->global_y, b = o->global_y + (double)o->height;
-        if(i==0 || l<bounds_min_x) bounds_min_x=l;
-        if(i==0 || r>bounds_max_x) bounds_max_x=r;
-        if(i==0 || t<bounds_min_y) bounds_min_y=t;
-        if(i==0 || b>bounds_max_y) bounds_max_y=b; }
-      LOG_INFO("Bounds: x=[%.0f,%.0f] y=[%.0f,%.0f]",
-               bounds_min_x, bounds_max_x, bounds_min_y, bounds_max_y); }
-
-    double est_x = (bounds_min_x + bounds_max_x) / 2.0;
-    double est_y = (bounds_min_y + bounds_max_y) / 2.0;
+    double est_x = outputs[0].global_x + outputs[0].width / 2.0;
+    double est_y = outputs[0].global_y + outputs[0].height / 2.0;
 
     /* Map surfaces with transparent frames */
     for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
@@ -1013,7 +1138,9 @@ int main(int argc, char *argv[]) {
         wl_surface_commit(o->surface); wl_buffer_destroy(b); munmap(d,size); }
     wl_display_roundtrip(display);
 
-    /* Retry cursor capture with multiple roundtrips */
+    /* Give the compositor a few immediate chances to deliver enter. If the
+     * cursor is hidden, capture may arrive much later; the main loop below
+     * intentionally keeps the full input region until then. */
     for (int retry = 0; retry < 8 && pointer && !cursor_captured; retry++) {
         usleep(30000);
         wl_display_roundtrip(display);
@@ -1024,12 +1151,12 @@ int main(int argc, char *argv[]) {
     else {
         est_x = outputs[0].global_x + outputs[0].width / 2.0;
         est_y = outputs[0].global_y + outputs[0].height / 2.0;
-        LOG_INFO("Cursor not captured, using output 0 center");
+        LOG_INFO("Cursor not captured yet; waiting indefinitely with full input region");
     }
     trail_set_position(&trail, est_x, est_y);
 
     LOG_INFO("Position: (%.0f,%.0f), %d outputs%s", est_x, est_y, num_outputs,
-             cursor_captured ? " (captured)" : " (primary output center)");
+             cursor_captured ? " (captured)" : " (initial estimate; capture pending)");
 
     setup_control_socket(socket_path);
     start_time_ms = get_time_ms();
@@ -1039,10 +1166,10 @@ int main(int argc, char *argv[]) {
         pthread_create(&kbd_thread, NULL, kbd_thread_fn, NULL);
     }
 
-    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK|TFD_CLOEXEC);
     struct itimerspec its = {{0,16666667},{0,1}};
     timerfd_settime(timer_fd, 0, &its, NULL);
-    int epfd = epoll_create1(0);
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
     struct epoll_event evt; evt.events=EPOLLIN;
     evt.data.fd=timer_fd; epoll_ctl(epfd,EPOLL_CTL_ADD,timer_fd,&evt);
     if(ctrl_fd>=0){ evt.data.fd=ctrl_fd; epoll_ctl(epfd,EPOLL_CTL_ADD,ctrl_fd,&evt); }
@@ -1053,9 +1180,11 @@ int main(int argc, char *argv[]) {
     LOG_INFO("Main loop");
     outputs_locked = 1;
 
-    while (running) {
-        /* Transition to bullseye: cursor captured, OR startup timeout (5s) */
-        if (!center_region_set && (cursor_captured || get_time_ms() - start_time_ms > 5000)) {
+    while (atomic_load(&running)) {
+        /* Keep the full input region until wl_pointer gives us an absolute
+         * position. There is deliberately no timeout/fallback here: a hidden
+         * cursor can make the initial enter arrive only after later motion. */
+        if (!center_region_set && cursor_captured) {
             for(int i=0;i<num_outputs;i++){
                 if (outputs[i].removed) continue;
                 struct wl_region *r = wl_compositor_create_region(compositor);
@@ -1073,12 +1202,45 @@ int main(int argc, char *argv[]) {
             LOG_INFO("Ring calibration region active (200x200 hollow, 2px)");
         }
 
-        while (wl_display_prepare_read(display)!=0) wl_display_dispatch_pending(display);
-        wl_display_flush(display);
+        int prepared = 0;
+        while (atomic_load(&running) && wl_display_prepare_read(display)!=0) {
+            if (wl_display_dispatch_pending(display) < 0)
+                atomic_store(&running, 0);
+        }
+        if (!atomic_load(&running)) break;
+        prepared = 1;
+        if (wl_display_flush(display) < 0 && errno != EAGAIN) {
+            wl_display_cancel_read(display);
+            atomic_store(&running, 0);
+            break;
+        }
         struct epoll_event events[8];
         int n = epoll_wait(epfd, events, 8, 10);
-        wl_display_read_events(display);
-        wl_display_dispatch_pending(display);
+        if (n < 0 && errno == EINTR) {
+            if (prepared) wl_display_cancel_read(display);
+            continue;
+        }
+        if (n < 0) {
+            if (prepared) wl_display_cancel_read(display);
+            atomic_store(&running, 0);
+            break;
+        }
+        int display_ready = 0;
+        for (int i = 0; i < n; i++)
+            if (events[i].data.fd == display_fd &&
+                (events[i].events & (EPOLLIN|EPOLLERR|EPOLLHUP)))
+                display_ready = 1;
+        if (display_ready) {
+            if (wl_display_read_events(display) < 0)
+                atomic_store(&running, 0);
+        } else {
+            wl_display_cancel_read(display);
+        }
+        if (!atomic_load(&running)) break;
+        if (wl_display_dispatch_pending(display) < 0) {
+            atomic_store(&running, 0);
+            break;
+        }
 
         for (int i=0;i<n;i++) {
             if (events[i].data.fd == timer_fd) {
@@ -1092,8 +1254,7 @@ int main(int argc, char *argv[]) {
                     trail_set_color_rgb(&trail, rr, gg, bb);
                 }
                 int alive = trail_cleanup(&trail, now);
-                int redraw = need_redraw;
-                need_redraw = 0;
+                int redraw = atomic_exchange(&need_redraw, 0);
                 pthread_mutex_unlock(&input_mutex);
 
                 if (alive > 0 || redraw) render_all();
@@ -1106,7 +1267,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    LOG_INFO("Shutting down");
+    int should_restart = atomic_load(&restart_requested);
+    LOG_INFO("Shutting down%s", should_restart ? " for restart" : "");
     wl_display_roundtrip(display);
     pthread_cancel(input_thread); pthread_join(input_thread, NULL);
     if (num_kbd > 0) { pthread_cancel(kbd_thread); pthread_join(kbd_thread, NULL); }
@@ -1122,6 +1284,12 @@ int main(int argc, char *argv[]) {
     for (int k = 0; k < num_kbd; k++) { if (kbd_evdev[k]) libevdev_free(kbd_evdev[k]); if (kbd_fd[k] >= 0) close(kbd_fd[k]); }
     if(ctrl_fd >= 0) { close(ctrl_fd); unlink(socket_path); }
     if(timer_fd >= 0) close(timer_fd);
+    if(epfd >= 0) close(epfd);
     if(g_log_file && g_log_file != stderr) fclose(g_log_file);
+    if (should_restart) {
+        execvp(argv[0], argv);
+        fprintf(stderr, "mouse-trail: restart failed: %s\n", strerror(errno));
+        return 1;
+    }
     return 0;
 }

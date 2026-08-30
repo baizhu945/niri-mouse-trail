@@ -19,8 +19,19 @@ void trail_init(trail_state_t *t, double width, uint64_t length_ms,
 }
 
 void trail_set_position(trail_state_t *t, double x, double y) {
+    double dx = x - t->pos_x;
+    double dy = y - t->pos_y;
     t->pos_x = x;
     t->pos_y = y;
+    /* Preserve visual continuity when the compositor corrects a small drift.
+     * Translate the existing history by the same correction so the newest
+     * segment does not jump or get cut at the calibration ring. */
+    for (int i = 0; i < t->count; i++) {
+        int idx = (t->head + i) % MAX_TRAIL_POINTS;
+        t->points[idx].x += dx;
+        t->points[idx].y += dy;
+    }
+    t->stationary_start = 0;
     LOG_INFO("trail_set_position: (%.1f, %.1f)", x, y);
 }
 
@@ -70,7 +81,7 @@ int trail_cleanup(trail_state_t *t, uint64_t now_ms) {
     return t->count;
 }
 
-int trail_render(trail_state_t *t, uint64_t now_ms,
+int trail_render(const trail_state_t *t, uint64_t now_ms,
                   trail_render_cb cb, void *user) {
     if (!t->visible) return 0;
 
@@ -79,7 +90,7 @@ int trail_render(trail_state_t *t, uint64_t now_ms,
     int rendered = 0;
     for (int i = 0; i < t->count; i++) {
         int idx = (t->head + i) % MAX_TRAIL_POINTS;
-        trail_point_t *pt = &t->points[idx];
+        const trail_point_t *pt = &t->points[idx];
 
         uint64_t age = now_ms - pt->timestamp_ms;
 
@@ -130,7 +141,7 @@ static int render_count = 0;
 
 static void test_cb(void *user, double x, double y, double radius, double alpha,
                      double r, double g, double b) {
-    (void)user; (void)r; (void)g; (void)b;
+    (void)user; (void)x; (void)y; (void)r; (void)g; (void)b;
     assert(radius >= 0.0 && radius <= 8.0);
     assert(alpha >= 0.0 && alpha <= 1.0);
     render_count++;
@@ -196,7 +207,19 @@ int main(void) {
     assert(moved == 0);
     printf("PASS: zero delta skipped\n");
 
-    printf("\n=== ALL TRAIL TESTS PASSED (8/8) ===\n");
+    printf("=== Test 9: absolute recalibration preserves trail history ===\n");
+    trail_init(&t, 8.0, 500, 2.0, 0.6, 1.0, 1.0, 1.0, 1.0);
+    trail_set_position(&t, 100.0, 100.0);
+    trail_feed(&t, 10.0, 5.0, 3000);
+    trail_feed(&t, 10.0, 5.0, 3010);
+    double first_x = t.points[t.head].x, first_y = t.points[t.head].y;
+    trail_set_position(&t, t.pos_x + 2.0, t.pos_y - 3.0);
+    assert(t.count == 2);
+    assert(t.points[t.head].x == first_x + 2.0);
+    assert(t.points[t.head].y == first_y - 3.0);
+    printf("PASS: count=%d history translated with calibration\n", t.count);
+
+    printf("\n=== ALL TRAIL TESTS PASSED (9/9) ===\n");
     return 0;
 }
 #endif
