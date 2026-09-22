@@ -38,19 +38,46 @@ let
 
   theme-sync-script = pkgs.writeShellScriptBin "mouse-trail-sync-theme" ''
     set -euo pipefail
-    SOCK="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/mouse-trail.sock"
-    # Retry until socket is ready (max 2s)
-    for i in $(seq 1 40); do
-        if [ -S "$SOCK" ]; then break; fi
+
+    RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    STATE_DIR="''${XDG_STATE_HOME:-$HOME/.local/state}/noctalia"
+    SOCK="$RUNTIME_DIR/mouse-trail.sock"
+    COLORS_JSON="$STATE_DIR/wallpaper-colors.json"
+
+    sync_theme() {
+      [ -S "$SOCK" ] || return 0
+      [ -f "$COLORS_JSON" ] || return 0
+
+      local theme
+      theme=$(${pkgs.jq}/bin/jq -r '.mPrimary // empty' "$COLORS_JSON" | sed 's/^#//')
+      [ -n "$theme" ] || return 0
+
+      # Socket creation can precede the daemon's accept loop by a few frames.
+      # Retry briefly so startup and rapid restarts still receive the color.
+      local attempt=0
+      while [ "$attempt" -lt 40 ]; do
+        if ${mouse-trail-pkg}/bin/mouse-trail --ctl "color $theme" >/dev/null 2>&1; then
+          echo "[mouse-trail-theme-sync] synchronized color #$theme"
+          return 0
+        fi
+        attempt=$((attempt + 1))
         sleep 0.05
+      done
+      return 0
+    }
+
+    mkdir -p "$RUNTIME_DIR" "$STATE_DIR"
+    sync_theme
+
+    ${pkgs.inotify-tools}/bin/inotifywait -m -q \
+      -e create -e moved_to \
+      --format '%f' \
+      "$RUNTIME_DIR" |
+    while IFS= read -r filename; do
+      if [ "$filename" = "mouse-trail.sock" ]; then
+        sync_theme
+      fi
     done
-    if [ ! -S "$SOCK" ]; then exit 0; fi
-    COLORS_JSON="$HOME/.config/noctalia/colors.json"
-    if [ ! -f "$COLORS_JSON" ]; then exit 0; fi
-    THEME=$(${pkgs.jq}/bin/jq -r '.mPrimary' "$COLORS_JSON" | sed 's/^#//')
-    if [ -n "$THEME" ] && [ "$THEME" != "null" ]; then
-        ${mouse-trail-pkg}/bin/mouse-trail --ctl "color $THEME" 2>/dev/null || true
-    fi
   '';
 
   toggle-script = pkgs.writeShellScriptBin "mouse-trail-toggle" ''
@@ -107,24 +134,16 @@ in
 
   systemd.user.services.mouse-trail-theme-sync = {
     Unit = {
-      Description = "Sync noctalia theme color to mouse-trail on startup";
-      StartLimitIntervalSec = 0;
+      Description = "Keep Noctalia theme color synchronized to mouse-trail";
+      After = [ "graphical-session.target" ];
+      PartOf = [ "graphical-session.target" ];
     };
     Service = {
-      Type = "oneshot";
+      Type = "simple";
       ExecStart = "${theme-sync-script}/bin/mouse-trail-sync-theme";
+      Restart = "on-failure";
+      RestartSec = "1s";
     };
-  };
-
-  systemd.user.paths.mouse-trail-theme-sync = {
-    Unit = {
-      Description = "Watch for mouse-trail socket to trigger theme sync";
-    };
-    Install = {
-      WantedBy = [ "default.target" ];
-    };
-    Path = {
-      PathExists = [ "%t/mouse-trail.sock" ];
-    };
+    Install.WantedBy = [ "graphical-session.target" ];
   };
 }
