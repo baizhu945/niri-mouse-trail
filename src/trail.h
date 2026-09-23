@@ -17,6 +17,9 @@ typedef struct {
     int count;
     double pos_x;          // estimated cursor global position
     double pos_y;
+    double visual_x, visual_y; // smoothed position used for drawing, not for cursor tracking
+    double last_sample_x, last_sample_y;
+    uint64_t last_point_ms;
     double max_radius;
     uint64_t max_age_ms;
     double min_speed;

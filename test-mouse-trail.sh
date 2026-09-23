@@ -1,116 +1,125 @@
 #!/usr/bin/env bash
+# Isolated CLI/config/IPC smoke tests. Never launch the overlay daemon.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG_FILE="/tmp/mouse-trail-test.log"
-BINARY="$SCRIPT_DIR/mouse-trail"
-PIDFILE="/tmp/mouse-trail-test.pid"
-RET=0
+BINARY="${1:-$SCRIPT_DIR/mouse-trail}"
+for tool in python3 strace timeout; do
+    command -v "$tool" >/dev/null || { echo "Missing test dependency: $tool" >&2; exit 1; }
+done
+[ -x "$BINARY" ] || { echo "Executable not found: $BINARY (pass its path as argument)" >&2; exit 1; }
 
+# Keep all paths (including the fake control sockets) in our own directory.
+WORK="$(mktemp -d "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/mouse-trail-test.XXXXXXXX")"
+SERVER_PID=
 cleanup() {
-    if [ -f "$PIDFILE" ]; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null || true
-        rm -f "$PIDFILE"
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
     fi
-    rm -f /tmp/mouse-trail.sock
+    /run/current-system/sw/bin/remove-without-permission -rf -- "$WORK"
 }
 trap cleanup EXIT
 
-echo "=== Test 1: Binary exists and shows help ==="
-if [ -x "$BINARY" ]; then
-    echo "PASS: Binary found at $BINARY ($(du -h "$BINARY" | cut -f1))"
-else
-    echo "FAIL: Binary not found"
-    exit 1
+pass() { printf 'PASS: %s\n' "$1"; }
+fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
+
+"$BINARY" --help >"$WORK/help" 2>&1 || fail '--help exit status'
+grep -q 'Usage:' "$WORK/help" && grep -q -- '--socket PATH' "$WORK/help" || fail '--help CLI options'
+pass 'help and CLI options'
+if "$BINARY" --not-a-real-option >"$WORK/invalid" 2>&1; then
+    fail 'unknown option should fail'
 fi
+pass 'unknown option returns failure'
 
-echo "=== Test 2: --help works ==="
-"$BINARY" --help 2>&1 | grep -q "Usage:" && echo "PASS: Help output OK" || { echo "FAIL: Help broken"; RET=1; }
-
-echo "=== Test 3: --ctl error without server ==="
-"$BINARY" --ctl "color #ff0000" 2>&1 | grep -q "Cannot connect" && echo "PASS: Proper error for missing server" || { echo "FAIL: Wrong ctl error"; RET=1; }
-
-echo "=== Test 4: Invalid device error ==="
-"$BINARY" --device /dev/input/nonexistent --log-file "$LOG_FILE" 2>/dev/null || true
-sleep 1
-if grep -q "Cannot open" "$LOG_FILE"; then
-    echo "PASS: Proper error on invalid device"
+# --ctl does not start a daemon and must not fall back to the real runtime socket.
+if timeout 5 "$BINARY" --socket "$WORK/missing.sock" --ctl show >"$WORK/missing.out" 2>&1; then
+    fail 'missing isolated socket should fail'
 else
-    echo "FAIL: No error for invalid device"
-    RET=1
+    status=$?
+    [ "$status" -ne 124 ] || fail 'missing-socket IPC timed out'
 fi
+pass 'missing isolated socket returns failure'
 
-echo "=== Test 5: Traverse log level names ==="
-for level in debug info warn error; do
-    "$BINARY" --log-level "$level" --device /dev/input/nonexistent --log-file "$LOG_FILE" 2>/dev/null || true
-    if grep -q "\[INFO" "$LOG_FILE" || grep -q "\[ERROR" "$LOG_FILE"; then
-        echo "PASS: Log level '$level' works"
-    else
-        echo "FAIL: Log level '$level' broken"
-        RET=1
-    fi
-done
+# Exercise the client against our own one-request UNIX server, never the user's service.
+start_server() {
+    local reply=$1 sock=$2
+    python3 - "$sock" "$reply" "$WORK/ready" "$WORK/message" <<'PY' &
+import socket
+import sys
 
-echo "=== Test 6: Color parsing ==="
-"$BINARY" --color "#ff0000" --device /dev/input/nonexistent --log-file "$LOG_FILE" --log-level debug 2>/dev/null || true
-if grep -q "#ff0000" "$LOG_FILE"; then
-    echo "PASS: Color #ff0000 parsed"
+path, reply, ready, message = sys.argv[1:]
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+    server.bind(path)
+    server.listen(1)
+    open(ready, 'w').close()
+    server.settimeout(5)
+    client, _ = server.accept()
+    with client:
+        client.settimeout(5)
+        data = client.recv(4096)
+        with open(message, 'wb') as out:
+            out.write(data)
+        client.sendall((reply + '\n').encode())
+PY
+    SERVER_PID=$!
+    for ((i=0; i<100; i++)); do
+        [ -f "$WORK/ready" ] && return 0
+        kill -0 "$SERVER_PID" 2>/dev/null || fail 'fake IPC server exited'
+        sleep 0.05
+    done
+    fail 'fake IPC server did not become ready'
+}
+
+finish_server() {
+    wait "$SERVER_PID" || fail 'fake IPC server failed'
+    SERVER_PID=
+    [ "$(<"$WORK/message")" = 'color 123abc' ] || fail 'IPC command bytes'
+    /run/current-system/sw/bin/remove-without-permission -f -- "$WORK/ready" "$WORK/message"
+}
+
+start_server OK "$WORK/ok.sock"
+timeout 5 "$BINARY" --socket "$WORK/ok.sock" --ctl 'color 123abc' >"$WORK/ok.out" 2>&1 || fail 'OK reply should succeed'
+finish_server
+pass 'IPC sends command and accepts OK'
+
+start_server ERR "$WORK/err.sock"
+if timeout 5 "$BINARY" --socket "$WORK/err.sock" --ctl 'color 123abc' >"$WORK/err.out" 2>&1; then
+    fail 'ERR reply should fail'
 else
-    echo "FAIL: Color not in logs"
-    RET=1
+    status=$?
+    [ "$status" -ne 124 ] || fail 'ERR reply IPC timed out'
 fi
+finish_server
+pass 'IPC rejects ERR'
 
-echo "=== Test 7: Starts in Wayland (if XDG_RUNTIME_DIR and WAYLAND_DISPLAY set) ==="
-if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-    "$BINARY" --log-file "$LOG_FILE" --log-level debug &
-    PID=$!
-    echo "$PID" > "$PIDFILE"
-    sleep 2
+# main.c parses import=... then restores --device from CLI. Trace only file
+# syscalls with a deliberately nonexistent Wayland socket: even if this host
+# has readable input devices, the compositor cannot be touched.
+mkdir -p "$WORK/home/.config/mouse-trail"
+printf 'device=%s\n' "$WORK/import-device" > "$WORK/import.conf"
+printf 'import=%s\ndevice=%s\n' "$WORK/import.conf" "$WORK/config-device" > "$WORK/home/.config/mouse-trail/config"
+trace_start() {
+    local trace=$1; shift
+    local status=0
+    timeout 10 strace -qq -e trace=file -o "$trace" \
+        env HOME="$WORK/home" WAYLAND_DISPLAY="mouse-trail-test-nonexistent-$$" \
+        "$BINARY" --socket "$WORK/no-daemon.sock" "$@" \
+        >"$WORK/run.out" 2>&1 || status=$?
+    [ "$status" -ne 124 ] || fail 'isolated config test timed out'
+    # Returning nonzero is expected without a real compositor / mouse.
+}
 
-    if kill -0 "$PID" 2>/dev/null; then
-        echo "PASS: Process running under Wayland (PID=$PID)"
+trace_start "$WORK/config.trace"
+grep -Fq "$WORK/import.conf" "$WORK/config.trace" || fail 'config import not read'
+grep -Fq "$WORK/config-device" "$WORK/config.trace" || fail 'config device not applied'
+pass 'default config and imported file are parsed'
 
-        if grep -q "Layer surface ready" "$LOG_FILE"; then
-            echo "PASS: Layer surface configured"
-        else
-            echo "INFO: Connected but surface not confirmed (log: $(grep Wayland "$LOG_FILE" | tail -1))"
-        fi
-
-        if grep -q "Input region set empty" "$LOG_FILE"; then
-            echo "PASS: Click passthrough configured"
-        fi
-
-        if grep -q "Opened input device" "$LOG_FILE"; then
-            echo "PASS: Input device opened"
-        fi
-
-        kill "$PID"
-        sleep 1
-        if ! kill -0 "$PID" 2>/dev/null; then
-            echo "PASS: Clean shutdown"
-        fi
-    else
-        echo "FAIL: Process died under Wayland"
-
-        if grep -q "ERROR" "$LOG_FILE"; then
-            echo "DIAG: $(grep ERROR "$LOG_FILE" | tail -3)"
-        fi
-
-        if grep -q "Cannot open /dev/input" "$LOG_FILE"; then
-            echo "INFO: Input device issue (expected if no /dev/input/event2)"
-        else
-            RET=1
-        fi
-    fi
-else
-    echo "SKIP: Not running under Wayland"
+trace_start "$WORK/cli.trace" --config "$WORK/home/.config/mouse-trail/config" --device "$WORK/cli-device"
+grep -Fq "$WORK/cli-device" "$WORK/cli.trace" || fail '--device not applied'
+if grep -Fq "$WORK/config-device" "$WORK/cli.trace"; then
+    fail 'config device incorrectly overrides CLI device'
 fi
+pass 'CLI device overrides config device'
 
-echo ""
-if [ "$RET" -eq 0 ]; then
-    echo "=== LOG VERIFICATION PASSED ==="
-else
-    echo "=== SOME TESTS FAILED ==="
-fi
-echo "Full log: $LOG_FILE"
-exit $RET
+echo 'All isolated mouse-trail tests passed.'

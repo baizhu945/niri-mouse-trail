@@ -22,14 +22,16 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP $(INCLUDES) -c $< -o $@
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+-include $(OBJS:.o=.d)
 
 test:
 	gcc -DTRAIL_TEST -I$(SRC_DIR) $(SRC_DIR)/trail.c -o /tmp/trail_test -lm
 	/tmp/trail_test
 
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET)
+	remove-without-permission -rf $(BUILD_DIR) $(TARGET)

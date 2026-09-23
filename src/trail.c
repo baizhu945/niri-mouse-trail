@@ -23,6 +23,10 @@ void trail_set_position(trail_state_t *t, double x, double y) {
     double dy = y - t->pos_y;
     t->pos_x = x;
     t->pos_y = y;
+    t->visual_x += dx;
+    t->visual_y += dy;
+    t->last_sample_x += dx;
+    t->last_sample_y += dy;
     /* Preserve visual continuity when the compositor corrects a small drift.
      * Translate the existing history by the same correction so the newest
      * segment does not jump or get cut at the calibration ring. */
@@ -36,27 +40,43 @@ void trail_set_position(trail_state_t *t, double x, double y) {
 }
 
 int trail_feed(trail_state_t *t, double rel_x, double rel_y, uint64_t now_ms) {
-    if (!t->visible) return 0;
     if (rel_x == 0.0 && rel_y == 0.0) return 0;
 
-    /* Update cursor position */
+    /* Track the actual (edge-clamped) cursor independently of the visual EMA.
+     * Hiding the trail must not make the position estimate drift behind. */
     t->pos_x += rel_x;
     t->pos_y += rel_y;
+    /* Even at 1.0, move the visual tail gradually instead of freezing it. */
+    double blend = fmax(0.01, 1.0 - t->smooth_factor);
+    t->visual_x += (t->pos_x - t->visual_x) * blend;
+    t->visual_y += (t->pos_y - t->visual_y) * blend;
+    if (!t->visible) return 0;
 
-    /* Add point at current absolute position */
-    int idx = (t->head + t->count) % MAX_TRAIL_POINTS;
-    t->points[idx].x = t->pos_x;
-    t->points[idx].y = t->pos_y;
-    t->points[idx].timestamp_ms = now_ms;
-
-    if (t->count < MAX_TRAIL_POINTS) {
-        t->count++;
-    } else {
-        t->head = (t->head + 1) % MAX_TRAIL_POINTS;
+    /* Accumulate small motions from the last sample, rather than throwing
+     * away every slow per-event delta. */
+    if (hypot(t->visual_x - t->last_sample_x,
+              t->visual_y - t->last_sample_y) < t->min_speed &&
+        hypot(t->pos_x - t->last_sample_x,
+              t->pos_y - t->last_sample_y) < t->min_speed) {
+        if (!t->stationary_start) t->stationary_start = now_ms;
+        return 0;
     }
+    t->stationary_start = 0;
+    if (t->last_point_ms && now_ms - t->last_point_ms <= 5) return 0;
+
+    int idx = (t->head + t->count) % MAX_TRAIL_POINTS;
+    t->points[idx].x = t->visual_x;
+    t->points[idx].y = t->visual_y;
+    t->points[idx].timestamp_ms = now_ms;
+    t->last_sample_x = t->visual_x;
+    t->last_sample_y = t->visual_y;
+    t->last_point_ms = now_ms;
+
+    if (t->count < MAX_TRAIL_POINTS) t->count++;
+    else t->head = (t->head + 1) % MAX_TRAIL_POINTS;
 
     LOG_DEBUG("trail: point added pos=(%.1f,%.1f) count=%d",
-              t->pos_x, t->pos_y, t->count);
+              t->visual_x, t->visual_y, t->count);
     return 1;
 }
 
@@ -152,7 +172,7 @@ int main(void) {
 
     printf("=== Test 1: trail_init ===\n");
     trail_state_t t;
-    trail_init(&t, 8.0, 500, 2.0, 0.6, 1.0, 0.0, 0.0, 1.0);
+    trail_init(&t, 8.0, 500, 2.0, 0.0, 1.0, 0.0, 0.0, 1.0);
     assert(t.max_radius == 8.0);
     assert(t.max_age_ms == 500);
     printf("PASS\n");
@@ -219,7 +239,38 @@ int main(void) {
     assert(t.points[t.head].y == first_y - 3.0);
     printf("PASS: count=%d history translated with calibration\n", t.count);
 
-    printf("\n=== ALL TRAIL TESTS PASSED (9/9) ===\n");
+    printf("=== Test 10: smoothing never moves the actual cursor ===\n");
+    trail_init(&t, 8.0, 500, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0);
+    trail_set_position(&t, 100.0, 100.0);
+    trail_feed(&t, 20.0, 0.0, 4000);
+    assert(t.pos_x == 120.0 && t.points[t.head].x == 110.0);
+    trail_feed(&t, 20.0, 0.0, 4010);
+    assert(t.pos_x == 140.0 && t.points[t.head + 1].x == 125.0);
+    printf("PASS: raw cursor and visual EMA are independent\n");
+
+    printf("=== Test 11: subthreshold motions accumulate ===\n");
+    trail_init(&t, 8.0, 500, 3.0, 0.0, 1.0, 1.0, 1.0, 1.0);
+    trail_set_position(&t, 0.0, 0.0);
+    assert(trail_feed(&t, 1.0, 0.0, 5000) == 0);
+    assert(trail_feed(&t, 1.0, 0.0, 5010) == 0);
+    assert(trail_feed(&t, 1.0, 0.0, 5020) == 1);
+    assert(t.pos_x == 3.0 && t.count == 1);
+    printf("PASS: threshold is relative to last sample\n");
+
+    printf("=== Test 12: hiding still tracks position without storing samples ===\n");
+    t.visible = false;
+    assert(trail_feed(&t, 10.0, 0.0, 5030) == 0);
+    assert(t.pos_x == 13.0 && t.count == 1);
+    printf("PASS: hidden cursor keeps tracking\n");
+
+    printf("=== Test 13: smoothing factor 1 still produces samples ===\n");
+    trail_init(&t, 8.0, 500, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0);
+    trail_set_position(&t, 100.0, 100.0);
+    assert(trail_feed(&t, 50.0, 0.0, 6000) == 1);
+    assert(t.pos_x == 150.0 && t.visual_x > 100.0 && t.count == 1);
+    printf("PASS: 100%% smoothing retains cursor tracking and a visible head\n");
+
+    printf("\n=== ALL TRAIL TESTS PASSED (13/13) ===\n");
     return 0;
 }
 #endif

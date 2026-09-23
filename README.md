@@ -57,7 +57,7 @@ Before using mouse-trail, ensure your system meets these prerequisites:
 - **Multi-monitor**: creates independent layer surfaces for each output
 - **Real-time control**: change color, width, opacity, speed via Unix socket
 - **HSL color cycling**: continuous rainbow trail with configurable cycle speed
-- **Click passthrough**: empty input region — the overlay never blocks mouse clicks
+- **Near-full click passthrough after calibration**: a thin center ring can intercept clicks; before the first cursor capture, the full-surface region can intercept input (see warning above)
 - **Stationary fade**: trail gracefully disappears ~1 second after mouse stops
 - **Screen-edge clamping**: trail stays bounded to desktop edges, matching compositor behavior
 - **Per-event tracking**: processes evdev events individually for accurate edge behavior
@@ -89,7 +89,7 @@ Then rebuild:
 home-manager switch
 ```
 
-This installs three commands: `mouse-trail`, `mouse-trail-toggle`, `mouse-trail-ctl`.
+This installs `mouse-trail`, `mouse-trail-toggle`, `mouse-trail-ctl`, and `mouse-trail-sync-theme`.
 
 ### Manual compilation
 

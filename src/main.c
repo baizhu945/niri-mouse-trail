@@ -23,14 +23,27 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <linux/input.h>
+#include <limits.h>
+#include <ctype.h>
+#include <sys/stat.h>
+#include <time.h>
 
 FILE *g_log_file = NULL;
 int g_log_level = 1;
 
 #define MAX_OUTPUTS 8
+#define BUFFER_SLOTS 3
+
+typedef struct {
+    struct wl_buffer *buffer;
+    void *data;
+    int width, height, stride;
+    int busy;
+} buffer_slot_t;
 
 typedef struct {
     struct wl_output *wl_output;
+    uint32_t registry_name;
     struct wl_surface *surface;
     struct zwlr_layer_surface_v1 *layer_surface;
     int global_x, global_y;
@@ -40,6 +53,9 @@ typedef struct {
     double scale;
     int configured;
     int removed;            /* marked when compositor removes this output */
+    buffer_slot_t buffers[BUFFER_SLOTS];
+    int has_committed;
+    int damage_x, damage_y, damage_w, damage_h; /* previous visible bounds */
 } output_t;
 
 static struct wl_display *display = NULL;
@@ -66,11 +82,10 @@ static int input_fd[MAX_MICE];
 static int is_abs[MAX_MICE];
 static double abs_last_x[MAX_MICE];
 static double abs_last_y[MAX_MICE];
-static int abs_has_pos[MAX_MICE];
+static int abs_has_x[MAX_MICE], abs_has_y[MAX_MICE];
 static double abs_pending_dx[MAX_MICE];
 static double abs_pending_dy[MAX_MICE];
 static int num_mice = 0;
-static uint64_t last_point_ms = 0;   /* throttle: one trail point per device poll */
 static struct libevdev *kbd_evdev[MAX_MICE];
 static int kbd_fd[MAX_MICE];
 static int num_kbd = 0;
@@ -78,6 +93,16 @@ static pthread_t input_thread, kbd_thread;
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int ctrl_fd = -1;
+static int owns_control_socket = 0;
+#define MAX_CLIENTS 16
+#define MAX_CONTROL_MESSAGE 255
+typedef struct {
+    int fd;
+    size_t used;
+    uint64_t connected_ms;
+    char message[MAX_CONTROL_MESSAGE + 1];
+} control_client_t;
+static control_client_t clients[MAX_CLIENTS];
 static int timer_fd = -1;
 static _Atomic int running = 1;
 static _Atomic int need_redraw = 0;
@@ -172,17 +197,6 @@ static double reachable_output_fraction(double x0, double y0,
     return reachable;
 }
 
-static void append_trail_point_locked(uint64_t now) {
-    if (now - last_point_ms <= 5) return;
-    int idx = (trail.head + trail.count) % MAX_TRAIL_POINTS;
-    trail.points[idx].x = trail.pos_x;
-    trail.points[idx].y = trail.pos_y;
-    trail.points[idx].timestamp_ms = now;
-    if (trail.count < MAX_TRAIL_POINTS) trail.count++;
-    else trail.head = (trail.head + 1) % MAX_TRAIL_POINTS;
-    last_point_ms = now;
-}
-
 static void apply_cursor_delta_locked(double dx, double dy, uint64_t now) {
     if (dx == 0.0 && dy == 0.0) return;
 
@@ -202,16 +216,15 @@ static void apply_cursor_delta_locked(double dx, double dy, uint64_t now) {
     }
     if (fabs(nx - x0) < 1e-12 && fabs(ny - y0) < 1e-12) return;
 
-    trail.pos_x = nx;
-    trail.pos_y = ny;
-    append_trail_point_locked(now);
-    trail.stationary_start = 0;
-    atomic_store(&need_redraw, 1);
+    /* Visual smoothing/threshold affect samples, never the raw cursor estimate. */
+    if (trail_feed(&trail, nx - x0, ny - y0, now))
+        atomic_store(&need_redraw, 1);
 }
 
 static uint64_t get_time_ms(void) {
-    struct timeval tv; gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
 static double hue2rgb(double p, double q, double t) {
@@ -319,35 +332,44 @@ static void request_restart(const char *reason) {
 
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
     const char *interface, uint32_t version) {
-    (void)data;(void)version;
-    if (strcmp(interface, wl_compositor_interface.name) == 0)
-        compositor = wl_registry_bind(reg, name, &wl_compositor_interface, 4);
+    (void)data;
+    if (strcmp(interface, wl_compositor_interface.name) == 0) {
+        if (version >= 4) compositor = wl_registry_bind(reg, name, &wl_compositor_interface, 4);
+        else LOG_ERROR("wl_compositor v4 required (server offers v%u)", version);
+    }
     else if (strcmp(interface, wl_shm_interface.name) == 0)
         shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
-    else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0)
-        layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 2);
+    else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
+        if (version >= 2) layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 2);
+        else LOG_ERROR("layer-shell v2 required (server offers v%u)", version);
+    }
     else if (strcmp(interface, wl_output_interface.name) == 0) {
         if (num_outputs < MAX_OUTPUTS) {
             if (outputs_locked && running) {
                 request_restart("new output detected");
                 return;
             }
-            struct wl_output *o = wl_registry_bind(reg, name, &wl_output_interface, 3);
+            if (version < 2) { LOG_ERROR("wl_output v2 required (server offers v%u)", version); return; }
+            struct wl_output *o = wl_registry_bind(reg, name, &wl_output_interface, version < 3 ? version : 3);
             wl_output_add_listener(o, &output_listener, NULL);
             memset(&outputs[num_outputs], 0, sizeof(output_t));
             outputs[num_outputs].wl_output = o;
+            outputs[num_outputs].registry_name = name;
             outputs[num_outputs].scale = 1.0;
             num_outputs++;
         }
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-        if (!seat) { seat = wl_registry_bind(reg, name, &wl_seat_interface, 2); pointer = wl_seat_get_pointer(seat); }
+        if (!seat) {
+            if (version < 2) { LOG_ERROR("wl_seat v2 required (server offers v%u)", version); return; }
+            seat = wl_registry_bind(reg, name, &wl_seat_interface, 2);
+            pointer = wl_seat_get_pointer(seat);
+        }
     }
 }
 static void registry_global_remove(void *data, struct wl_registry *reg, uint32_t name) {
     (void)data;(void)reg;
     for (int i = 0; i < num_outputs; i++) {
-        if (outputs[i].wl_output && 
-            wl_proxy_get_id((struct wl_proxy *)outputs[i].wl_output) == name) {
+        if (outputs[i].wl_output && outputs[i].registry_name == name) {
             outputs[i].removed = 1;
             LOG_INFO("Output %d removed", i);
             return;
@@ -361,6 +383,11 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *s,
     (void)data; zwlr_layer_surface_v1_ack_configure(s, serial);
     for (int i = 0; i < num_outputs; i++)
         if (outputs[i].layer_surface == s) {
+            if (outputs[i].width != (int)w || outputs[i].height != (int)h) {
+                outputs[i].has_committed = 0;
+                outputs[i].damage_w = outputs[i].damage_h = 0;
+                atomic_store(&need_redraw, 1);
+            }
             outputs[i].width=(int)w; outputs[i].height=(int)h; outputs[i].configured=1;
             outputs[i].cursor_width=(int)w; outputs[i].cursor_height=(int)h;
             if (outputs[i].phys_w > 0 && w > 0)
@@ -393,18 +420,51 @@ static void layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *s) {
 }
 static const struct zwlr_layer_surface_v1_listener layer_surface_listener = { .configure=layer_surface_configure, .closed=layer_surface_closed };
 
-static struct wl_buffer *create_shm_buffer(int w, int h, void **data_out, int *stride_out) {
+static void buffer_released(void *data, struct wl_buffer *buffer) {
+    (void)buffer;
+    ((buffer_slot_t *)data)->busy = 0;
+}
+static const struct wl_buffer_listener buffer_listener = { .release = buffer_released };
+
+static void destroy_buffer_slot(buffer_slot_t *slot) {
+    if (slot->buffer) wl_buffer_destroy(slot->buffer);
+    if (slot->data) munmap(slot->data, (size_t)slot->stride * slot->height);
+    memset(slot, 0, sizeof(*slot));
+}
+
+static int create_buffer_slot(buffer_slot_t *slot, int w, int h) {
+    if (w <= 0 || h <= 0 || w > INT32_MAX / 4 || h > INT32_MAX / (w * 4))
+        return 0;
     int stride = w * 4, size = stride * h;
-    int fd = memfd_create("mt", MFD_CLOEXEC|MFD_ALLOW_SEALING);
-    if (fd < 0) return NULL;
-    if (ftruncate(fd, size) < 0) { close(fd); return NULL; }
-    void *d = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (d == MAP_FAILED) { close(fd); return NULL; }
-    struct wl_shm_pool *p = wl_shm_create_pool(shm, fd, size);
-    struct wl_buffer *b = wl_shm_pool_create_buffer(p, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
-    wl_shm_pool_destroy(p); close(fd);
-    *data_out = d; *stride_out = stride;
-    return b;
+    int fd = memfd_create("mouse-trail", MFD_CLOEXEC);
+    if (fd < 0) return 0;
+    if (ftruncate(fd, size) < 0) { close(fd); return 0; }
+    void *data = mmap(NULL, (size_t)size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) { close(fd); return 0; }
+    struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
+    close(fd);
+    if (!pool) { munmap(data, (size_t)size); return 0; }
+    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    if (!buffer) { munmap(data, (size_t)size); return 0; }
+    slot->buffer = buffer;
+    slot->data = data;
+    slot->width = w; slot->height = h; slot->stride = stride;
+    wl_buffer_add_listener(buffer, &buffer_listener, slot);
+    return 1;
+}
+
+static buffer_slot_t *acquire_buffer_slot(output_t *out) {
+    for (int i = 0; i < BUFFER_SLOTS; i++) {
+        buffer_slot_t *slot = &out->buffers[i];
+        if (slot->busy) continue; /* compositor still reading the old contents */
+        if (slot->buffer && (slot->width != out->width || slot->height != out->height))
+            destroy_buffer_slot(slot);
+        if (!slot->buffer && !create_buffer_slot(slot, out->width, out->height))
+            return NULL;
+        return slot;
+    }
+    return NULL;
 }
 
 typedef struct { cairo_t *cr; double px, py; int has; } comet_ctx_t;
@@ -413,7 +473,16 @@ static void draw_trail_point(void *user, double x, double y, double radius,
     double alpha, double r, double g, double b) {
     comet_ctx_t *ctx = (comet_ctx_t*)user;
     if (trail_style_comet) {
-        if (!ctx->has) { ctx->px = x; ctx->py = y; ctx->has = 1; return; }
+        if (!ctx->has) {
+            /* A short motion may yield only one sample: still draw its head. */
+            cairo_save(ctx->cr);
+            cairo_set_source_rgba(ctx->cr, r, g, b, alpha);
+            cairo_arc(ctx->cr, x, y, radius, 0.0, 2.0 * M_PI);
+            cairo_fill(ctx->cr);
+            cairo_restore(ctx->cr);
+            ctx->px = x; ctx->py = y; ctx->has = 1;
+            return;
+        }
         cairo_save(ctx->cr);
         cairo_set_source_rgba(ctx->cr, r, g, b, alpha);
         cairo_set_line_width(ctx->cr, radius * 2.0);
@@ -435,22 +504,85 @@ static void draw_trail_point(void *user, double x, double y, double radius,
 
 static void render_output(output_t *out, const trail_state_t *state) {
     if (out->removed || out->width <= 0 || out->height <= 0 || !out->configured) return;
-    void *data; int stride;
-    struct wl_buffer *buf = create_shm_buffer(out->width, out->height, &data, &stride);
-    if (!buf) return;
-    cairo_surface_t *cs = cairo_image_surface_create_for_data((unsigned char*)data, CAIRO_FORMAT_ARGB32, out->width, out->height, stride);
+    uint64_t now = get_time_ms();
+    int left = out->width, top = out->height, right = 0, bottom = 0;
+    int has_fresh = 0;
+    if (state->visible) for (int i = 0; i <= state->count; i++) {
+        const trail_point_t *pt = NULL;
+        if (i < state->count) {
+            pt = &state->points[(state->head + i) % MAX_TRAIL_POINTS];
+            if (now - pt->timestamp_ms > state->max_age_ms) continue;
+            has_fresh = 1;
+        } else if (!has_fresh) break;
+        /* Include the actual cursor head as well as the smoothed tail. */
+        double x = (pt ? pt->x : state->pos_x) - out->global_x;
+        double y = (pt ? pt->y : state->pos_y) - out->global_y;
+        double margin = state->max_radius + 2.0;
+        /* Include off-output endpoints: a comet segment can cross this output. */
+        int x0 = (int)fmax(0, fmin(out->width, floor(x - margin)));
+        int y0 = (int)fmax(0, fmin(out->height, floor(y - margin)));
+        int x1 = (int)fmax(0, fmin(out->width, ceil(x + margin)));
+        int y1 = (int)fmax(0, fmin(out->height, ceil(y + margin)));
+        if (x0 < left) left = x0;
+        if (y0 < top) top = y0;
+        if (x1 > right) right = x1;
+        if (y1 > bottom) bottom = y1;
+    }
+    int visible = right > left && bottom > top;
+    if (out->has_committed && !visible && !out->damage_w) return;
+    int dx = 0, dy = 0, dw = out->width, dh = out->height;
+    if (out->has_committed) {
+        dx = visible ? left : out->damage_x;
+        dy = visible ? top : out->damage_y;
+        int far_x = visible ? right : out->damage_x + out->damage_w;
+        int far_y = visible ? bottom : out->damage_y + out->damage_h;
+        if (out->damage_w) {
+            dx = dx < out->damage_x ? dx : out->damage_x;
+            dy = dy < out->damage_y ? dy : out->damage_y;
+            if (out->damage_x + out->damage_w > far_x) far_x = out->damage_x + out->damage_w;
+            if (out->damage_y + out->damage_h > far_y) far_y = out->damage_y + out->damage_h;
+        }
+        dw = far_x - dx; dh = far_y - dy;
+    }
+    buffer_slot_t *slot = acquire_buffer_slot(out);
+    if (!slot) { atomic_store(&need_redraw, 1); return; }
+    cairo_surface_t *cs = cairo_image_surface_create_for_data(
+        slot->data, CAIRO_FORMAT_ARGB32, out->width, out->height, slot->stride);
     cairo_t *cr = cairo_create(cs);
     cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR); cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_translate(cr, -(double)out->global_x, -(double)out->global_y);
     comet_ctx_t ctx = { cr, 0, 0, 0 };
-    trail_render(state, get_time_ms(), draw_trail_point, &ctx);
+    int rendered = trail_render(state, now, draw_trail_point, &ctx);
+    if (rendered > 0) {
+        /* Smooth only the tail. Keep the head on the real cursor while giving
+         * it the same age-based fade as the newest sample after a stop. */
+        int latest = (state->head + state->count - 1) % MAX_TRAIL_POINTS;
+        double age = fmin(1.0, (double)(now - state->points[latest].timestamp_ms) /
+                               (double)state->max_age_ms);
+        double alpha = state->a * (1.0 - age * age * age);
+        double radius = state->max_radius * (1.0 - age) * (1.0 - age);
+        if (trail_style_comet && ctx.has) {
+            cairo_set_source_rgba(cr, state->r, state->g, state->b, alpha);
+            cairo_set_line_width(cr, radius * 2.0);
+            cairo_move_to(cr, ctx.px, ctx.py);
+            cairo_line_to(cr, state->pos_x, state->pos_y);
+            cairo_stroke(cr);
+        }
+        cairo_set_source_rgba(cr, state->r, state->g, state->b, alpha);
+        cairo_arc(cr, state->pos_x, state->pos_y, radius, 0, 2 * M_PI);
+        cairo_fill(cr);
+    }
     cairo_destroy(cr); cairo_surface_destroy(cs);
-    wl_surface_attach(out->surface, buf, 0, 0);
-    wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
+    wl_surface_attach(out->surface, slot->buffer, 0, 0);
+    wl_surface_damage_buffer(out->surface, dx, dy, dw, dh);
+    slot->busy = 1;
     wl_surface_commit(out->surface);
-    munmap(data, stride * out->height);
-    wl_buffer_destroy(buf);
+    out->has_committed = 1;
+    out->damage_x = visible ? left : 0;
+    out->damage_y = visible ? top : 0;
+    out->damage_w = visible ? right - left : 0;
+    out->damage_h = visible ? bottom - top : 0;
 }
 
 static void render_all(void) {
@@ -461,33 +593,182 @@ static void render_all(void) {
     for (int i = 0; i < num_outputs; i++) render_output(&outputs[i], &snapshot);
 }
 
-static void handle_control_msg(const char *msg) {
-    if (strncmp(msg, "color ", 6)==0) {
-        unsigned int ri,gi,bi;
-        const char *c = msg + 6;
-        if (*c == '#') c++;
-        if (sscanf(c,"%02x%02x%02x",&ri,&gi,&bi)==3) { trail_set_color_rgb(&trail,ri/255.0,gi/255.0,bi/255.0); need_redraw=1; }
-    } else if (strcmp(msg,"color-cycle on")==0) { color_cycle_on=1; need_redraw=1; }
-    else if (strcmp(msg,"color-cycle off")==0) { color_cycle_on=0; need_redraw=1; }
-    else if (strncmp(msg,"width ",6)==0) { trail.max_radius=atof(msg+6); need_redraw=1; }
-    else if (strncmp(msg,"speed ",6)==0) { trail.max_age_ms=(uint64_t)atoi(msg+6); need_redraw=1; }
-    else if (strncmp(msg,"alpha ",6)==0) { trail.a=atof(msg+6); need_redraw=1; }
-    else if (strcmp(msg,"show")==0) { trail.visible=true; need_redraw=1; }
-    else if (strcmp(msg,"hide")==0) { trail.visible=false; need_redraw=1; }
-    else if (strcmp(msg,"warp")==0) {
-        request_restart("manual warp command");
+static int parse_number(const char *s, double min, double max, double *value) {
+    if (!s || !*s) return 0;
+    char *end;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (end == s || *end || errno || !isfinite(v) || v < min || v > max) return 0;
+    *value = v;
+    return 1;
+}
+
+static int parse_duration(const char *s, uint64_t *value) {
+    if (!s || !*s || *s == '-') return 0;
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (end == s || *end || errno || v == 0 || v > UINT32_MAX) return 0;
+    *value = (uint64_t)v;
+    return 1;
+}
+
+static int parse_color(const char *text, double *r, double *g, double *b) {
+    const char *s = text && *text == '#' ? text + 1 : text;
+    if (!s || strlen(s) != 6) return 0;
+    for (int i = 0; i < 6; i++) if (!isxdigit((unsigned char)s[i])) return 0;
+    unsigned int ri, gi, bi;
+    if (sscanf(s, "%2x%2x%2x", &ri, &gi, &bi) != 3) return 0;
+    *r = ri / 255.0; *g = gi / 255.0; *b = bi / 255.0;
+    return 1;
+}
+
+static int handle_control_msg(const char *msg) {
+    double value, r, g, b;
+    uint64_t duration;
+    if (strncmp(msg, "color ", 6) == 0) {
+        if (!parse_color(msg + 6, &r, &g, &b)) return 0;
+        trail_set_color_rgb(&trail, r, g, b);
+    } else if (strcmp(msg, "color-cycle on") == 0) color_cycle_on = 1;
+    else if (strcmp(msg, "color-cycle off") == 0) color_cycle_on = 0;
+    else if (strncmp(msg, "width ", 6) == 0) {
+        if (!parse_number(msg + 6, 0.01, 1000.0, &value)) return 0;
+        trail.max_radius = value;
+    } else if (strncmp(msg, "speed ", 6) == 0) {
+        if (!parse_duration(msg + 6, &duration)) return 0;
+        trail.max_age_ms = duration;
+    } else if (strncmp(msg, "alpha ", 6) == 0) {
+        if (!parse_number(msg + 6, 0.0, 1.0, &value)) return 0;
+        trail.a = value;
+    } else if (strcmp(msg, "show") == 0) {
+        trail.visible = true;
+        trail.count = 0; /* no history from the hidden interval */
+        trail.last_sample_x = trail.visual_x;
+        trail.last_sample_y = trail.visual_y;
+    } else if (strcmp(msg, "hide") == 0) {
+        trail.visible = false;
+        trail.count = 0;
+    } else if (strcmp(msg, "warp") == 0) request_restart("manual warp command");
+    else return 0;
+    atomic_store(&need_redraw, 1);
+    return 1;
+}
+
+static int setup_control_socket(const char *path) {
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        LOG_ERROR("Control socket path is too long: %s", path);
+        return -1;
+    }
+    strcpy(addr.sun_path, path);
+    ctrl_fd = socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
+    if (ctrl_fd < 0) return -1;
+    mode_t old_umask = umask(0077);
+    int rc = bind(ctrl_fd, (struct sockaddr *)&addr, sizeof(addr));
+    int saved_errno = errno;
+    umask(old_umask);
+    if (rc < 0 && saved_errno == EADDRINUSE) {
+        struct stat st;
+        int probe = socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
+        if (probe < 0) goto fail;
+        int connected = connect(probe, (struct sockaddr *)&addr, sizeof(addr));
+        int probe_errno = errno;
+        close(probe);
+        if (connected == 0 || probe_errno == EINPROGRESS || probe_errno == EAGAIN) {
+            LOG_ERROR("Another mouse-trail owns %s", path);
+            goto fail;
+        }
+        if (probe_errno != ECONNREFUSED && probe_errno != ENOENT) {
+            LOG_ERROR("Unable to verify whether control socket is stale: %s", path);
+            goto fail;
+        }
+        if (lstat(path, &st) < 0 || !S_ISSOCK(st.st_mode) || st.st_uid != geteuid() ||
+            unlink(path) < 0) {
+            LOG_ERROR("Refusing to remove existing control path: %s", path);
+            goto fail;
+        }
+        old_umask = umask(0077);
+        rc = bind(ctrl_fd, (struct sockaddr *)&addr, sizeof(addr));
+        saved_errno = errno;
+        umask(old_umask);
+    }
+    if (rc < 0 || listen(ctrl_fd, MAX_CLIENTS) < 0) {
+        LOG_ERROR("Control socket setup failed: %s", strerror(rc < 0 ? saved_errno : errno));
+        if (rc == 0) unlink(path);
+        goto fail;
+    }
+    owns_control_socket = 1;
+    return 0;
+fail:
+    close(ctrl_fd); ctrl_fd = -1;
+    return -1;
+}
+
+static void close_control_client(int epfd, control_client_t *client) {
+    epoll_ctl(epfd, EPOLL_CTL_DEL, client->fd, NULL);
+    close(client->fd);
+    client->fd = -1;
+    client->used = 0;
+}
+
+static void finish_control_client(int epfd, control_client_t *client, int complete) {
+    int ok = 0;
+    if (complete && client->used) {
+        client->message[client->used] = '\0';
+        char *newline = strchr(client->message, '\n');
+        if (newline) *newline = '\0';
+        ok = handle_control_msg(client->message);
+    }
+    const char *response = ok ? "OK\n" : "ERR\n";
+    (void)send(client->fd, response, strlen(response), MSG_NOSIGNAL | MSG_DONTWAIT);
+    close_control_client(epfd, client);
+}
+
+static void accept_control_clients(int epfd) {
+    for (;;) {
+        int fd = accept4(ctrl_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+                LOG_WARN("Control accept failed: %s", strerror(errno));
+            return;
+        }
+        int index = 0;
+        while (index < MAX_CLIENTS && clients[index].fd >= 0) index++;
+        if (index == MAX_CLIENTS) { close(fd); continue; }
+        control_client_t *client = &clients[index];
+        client->fd = fd;
+        client->used = 0;
+        client->connected_ms = get_time_ms();
+        struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
+                                     .data.fd = fd };
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event) < 0)
+            close_control_client(epfd, client);
     }
 }
 
-static void setup_control_socket(const char *path) {
-    unlink(path);
-    ctrl_fd = socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
-    if (ctrl_fd < 0) return;
-    struct sockaddr_un addr; memset(&addr,0,sizeof(addr)); addr.sun_family=AF_UNIX;
-    { size_t len = strlen(path); if (len >= sizeof(addr.sun_path)) len = sizeof(addr.sun_path)-1;
-      memcpy(addr.sun_path, path, len); addr.sun_path[len] = '\0'; }
-    if (bind(ctrl_fd,(struct sockaddr*)&addr,sizeof(addr))<0) { close(ctrl_fd); ctrl_fd=-1; return; }
-    if (listen(ctrl_fd,5)<0) { close(ctrl_fd); ctrl_fd=-1; return; }
+static void read_control_client(int epfd, control_client_t *client) {
+    for (;;) {
+        ssize_t n = recv(client->fd, client->message + client->used,
+                         MAX_CONTROL_MESSAGE - client->used, 0);
+        if (n > 0) {
+            client->used += (size_t)n;
+            client->connected_ms = get_time_ms();
+            if (memchr(client->message, '\n', client->used)) {
+                finish_control_client(epfd, client, 1);
+                return;
+            }
+            if (client->used == MAX_CONTROL_MESSAGE) {
+                finish_control_client(epfd, client, 0);
+                return;
+            }
+        } else if (n == 0) {
+            finish_control_client(epfd, client, 1);
+            return;
+        } else if (errno == EINTR) continue;
+        else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        else { close_control_client(epfd, client); return; }
+    }
 }
 
 static void process_input_event(int m, const struct input_event *ev) {
@@ -503,7 +784,8 @@ static void process_input_event(int m, const struct input_event *ev) {
         double *last = (ev->code == ABS_X) ? &abs_last_x[m] : &abs_last_y[m];
         double *pending = (ev->code == ABS_X) ? &abs_pending_dx[m] : &abs_pending_dy[m];
         double cur = (double)ev->value;
-        if (!abs_has_pos[m]) { *last = cur; abs_has_pos[m] = 1; }
+        int *has_pos = (ev->code == ABS_X) ? &abs_has_x[m] : &abs_has_y[m];
+        if (!*has_pos) { *last = cur; *has_pos = 1; }
         else if (cur != *last) {
             *pending += cur - *last;
             *last = cur;
@@ -513,6 +795,8 @@ static void process_input_event(int m, const struct input_event *ev) {
         double dx = abs_pending_dx[m], dy = abs_pending_dy[m];
         abs_pending_dx[m] = 0;
         abs_pending_dy[m] = 0;
+        /* Each ABS axis can report independently; the first event of each
+         * establishes its own baseline, with no cross-axis dependency. */
         int ax = libevdev_get_abs_maximum(evdev[m], ABS_X) -
                  libevdev_get_abs_minimum(evdev[m], ABS_X);
         int ay = libevdev_get_abs_maximum(evdev[m], ABS_Y) -
@@ -526,7 +810,7 @@ static void process_input_event(int m, const struct input_event *ev) {
         pthread_mutex_unlock(&input_mutex);
     } else if (ev->type == EV_KEY && is_abs[m] &&
                ev->code == BTN_TOUCH && ev->value == 0) {
-        abs_has_pos[m] = 0;
+        abs_has_x[m] = abs_has_y[m] = 0;
         abs_pending_dx[m] = 0;
         abs_pending_dy[m] = 0;
     }
@@ -673,7 +957,8 @@ static void detect_warp_bindings(void) {
                     if (last) {
                         char keyname[32] = {0};
                         char *ks = last + 1, *kd = keyname;
-                        while (*ks && *ks != ' ' && *ks != '\t' && *ks != '{' && *ks != ')') *kd++ = *ks++;
+                        while (*ks && *ks != ' ' && *ks != '\t' && *ks != '{' && *ks != ')' &&
+                               kd < keyname + sizeof(keyname) - 1) *kd++ = *ks++;
                         wb.key_code = lookup_keycode(keyname);
                     }
                 } else if (is_sway) {
@@ -685,7 +970,8 @@ static void detect_warp_bindings(void) {
                     char *last = strrchr(pline, '+');
                     if (last) {
                         char keyname[32] = {0}, *ks = last + 1, *kd = keyname;
-                        while (*ks && *ks != ' ' && *ks != '\t') *kd++ = *ks++;
+                        while (*ks && *ks != ' ' && *ks != '\t' &&
+                               kd < keyname + sizeof(keyname) - 1) *kd++ = *ks++;
                         wb.key_code = lookup_keycode(keyname);
                     }
                 } else if (is_hypr) {
@@ -703,7 +989,8 @@ static void detect_warp_bindings(void) {
                         if (comma) {
                             char keyname[32] = {0}, *ks = comma + 1, *kd = keyname;
                             while (*ks == ' ') ks++;
-                            while (*ks && *ks != ' ' && *ks != ',' && *ks != '\t') *kd++ = *ks++;
+                            while (*ks && *ks != ' ' && *ks != ',' && *ks != '\t' &&
+                                   kd < keyname + sizeof(keyname) - 1) *kd++ = *ks++;
                             wb.key_code = lookup_keycode(keyname);
                         }
                     }
@@ -818,14 +1105,35 @@ static void *kbd_thread_fn(void *arg) {
 }
 
 static int send_control_cmd(const char *sock, const char *cmd) {
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    size_t len = strlen(cmd);
+    if (strlen(sock) >= sizeof(addr.sun_path) || len == 0 || len >= MAX_CONTROL_MESSAGE)
+        return 1;
+    strcpy(addr.sun_path, sock);
     int fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
     if (fd < 0) return 1;
-    struct sockaddr_un addr; memset(&addr,0,sizeof(addr)); addr.sun_family=AF_UNIX;
-    { size_t len = strlen(sock); if (len >= sizeof(addr.sun_path)) len = sizeof(addr.sun_path)-1;
-      memcpy(addr.sun_path, sock, len); addr.sun_path[len] = '\0'; }
-    if (connect(fd,(struct sockaddr*)&addr,sizeof(addr))<0) { close(fd); return 1; }
-    if (write(fd, cmd, strlen(cmd)) < 0) {}
-    close(fd); return 0;
+    struct timeval timeout = { .tv_sec = 2 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return 1; }
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, cmd + sent, len - sent, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); return 1; }
+        sent += (size_t)n;
+    }
+    if (shutdown(fd, SHUT_WR) < 0) { close(fd); return 1; }
+    char reply[4] = {0};
+    size_t received = 0;
+    while (received < 3) {
+        ssize_t n = recv(fd, reply + received, 3 - received, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        received += (size_t)n;
+    }
+    close(fd);
+    return (received == 3 && strcmp(reply, "OK\n") == 0) ? 0 : 1;
 }
 
 /* Config file parser */
@@ -853,19 +1161,28 @@ static void parse_config(const char *path,
         char *key = p, *val = eq + 1;
         while (*key && (key[strlen(key)-1]==' '||key[strlen(key)-1]=='\t')) key[strlen(key)-1]='\0';
         while (*val == ' ' || *val == '\t') val++;
-
-        if (strcmp(key, "import") == 0) { parse_config(val, cr, cg, cb, ca, width, length_ms, min_speed, smooth_factor, color_cycle_on, cycle_speed, trail_style_comet, device, kbd_device); }
-        else if (strcmp(key, "color") == 0) { unsigned int ri,gi,bi; const char *cv = val; if (*cv=='#') cv++; if(sscanf(cv,"%02x%02x%02x",&ri,&gi,&bi)==3){ *cr=ri/255.0;*cg=gi/255.0;*cb=bi/255.0; } }
-        else if (strcmp(key, "alpha") == 0) *ca = atof(val);
-        else if (strcmp(key, "width") == 0) *width = atof(val);
-        else if (strcmp(key, "length") == 0) *length_ms = (uint64_t)atoi(val);
-        else if (strcmp(key, "min_speed") == 0) *min_speed = atof(val);
-        else if (strcmp(key, "smooth_factor") == 0) *smooth_factor = atof(val);
-        else if (strcmp(key, "color_cycle") == 0) *color_cycle_on = (strcmp(val, "on") == 0);
-        else if (strcmp(key, "cycle_speed") == 0) *cycle_speed = atof(val);
-        else if (strcmp(key, "device") == 0) { *device = strdup(val); }
-        else if (strcmp(key, "kbd_device") == 0) { *kbd_device = strdup(val); }
-        else if (strcmp(key, "trail_style") == 0) { *trail_style_comet = (strcmp(val, "comet") == 0); }
+        size_t vlen = strlen(val);
+        while (vlen && (val[vlen - 1] == ' ' || val[vlen - 1] == '\t' || val[vlen - 1] == '\r'))
+            val[--vlen] = '\0';
+        double number;
+        uint64_t duration;
+        int valid = 1;
+        if (strcmp(key, "import") == 0) {
+            parse_config(val, cr, cg, cb, ca, width, length_ms, min_speed,
+                         smooth_factor, color_cycle_on, cycle_speed, trail_style_comet,
+                         device, kbd_device);
+        } else if (strcmp(key, "color") == 0) valid = parse_color(val, cr, cg, cb);
+        else if (strcmp(key, "alpha") == 0) { valid = parse_number(val, 0.0, 1.0, &number); if (valid) *ca = number; }
+        else if (strcmp(key, "width") == 0) { valid = parse_number(val, 0.01, 1000.0, &number); if (valid) *width = number; }
+        else if (strcmp(key, "length") == 0) { valid = parse_duration(val, &duration); if (valid) *length_ms = duration; }
+        else if (strcmp(key, "min_speed") == 0) { valid = parse_number(val, 0.0, 1000.0, &number); if (valid) *min_speed = number; }
+        else if (strcmp(key, "smooth_factor") == 0) { valid = parse_number(val, 0.0, 1.0, &number); if (valid) *smooth_factor = number; }
+        else if (strcmp(key, "color_cycle") == 0) { valid = strcmp(val, "on") == 0 || strcmp(val, "off") == 0; if (valid) *color_cycle_on = strcmp(val, "on") == 0; }
+        else if (strcmp(key, "cycle_speed") == 0) { valid = parse_number(val, 0.01, 86400.0, &number); if (valid) *cycle_speed = number; }
+        else if (strcmp(key, "device") == 0) { if (*val) *device = strdup(val); else valid = 0; }
+        else if (strcmp(key, "kbd_device") == 0) { if (*val) *kbd_device = strdup(val); else valid = 0; }
+        else if (strcmp(key, "trail_style") == 0) { valid = strcmp(val, "comet") == 0 || strcmp(val, "dots") == 0; if (valid) *trail_style_comet = strcmp(val, "comet") == 0; }
+        if (!valid) fprintf(stderr, "mouse-trail: invalid %s in %s\n", key, path);
     }
     fclose(f);
 }
@@ -874,8 +1191,8 @@ static void usage(const char *p) {
         fprintf(stderr,
         "Usage: %s [OPTIONS]\n"
         "  --config PATH       Config file (default: ~/.config/mouse-trail/config)\n"
-        "  --device PATH       Input device (default: /dev/input/event2)\n"
-        "  --kbd-device PATH    Keyboard for hotkey detection (default: /dev/input/event5)\n"
+        "  --device PATH       Input device (default: auto-detect)\n"
+        "  --kbd-device PATH   Keyboard for hotkey detection (default: auto-detect)\n"
         "  --color RRGGBB     Trail color (default: ffffff)\n  --alpha N       Opacity 0-1\n"
         "  --width N           Head radius px\n  --length N    Duration ms\n"
         "  --min-speed N       Stationary threshold px\n  --smooth-factor N EMA 0-1\n"
@@ -900,36 +1217,14 @@ int main(int argc, char *argv[]) {
     int log_level=1; const char *log_path=NULL, *socket_path=NULL, *ctl_cmd=NULL;
     const char *config_path = NULL;
 
-    for (int i=1;i<argc;i++) {
-        if (strcmp(argv[i],"--help")==0) { usage(argv[0]); return 0; }
-        else if (strcmp(argv[i],"--config")==0&&i+1<argc) config_path=argv[++i];
-        else if (strcmp(argv[i],"--device")==0&&i+1<argc) device_path=argv[++i];
-        else if (strcmp(argv[i],"--kbd-device")==0&&i+1<argc) kbd_device_path=argv[++i];
-        else if (strcmp(argv[i],"--color")==0&&i+1<argc) {
-            const char *c = argv[++i];
-            unsigned int ri,gi,bi;
-            if (*c == '#') c++;
-            if (sscanf(c,"%02x%02x%02x",&ri,&gi,&bi)==3) { cr=ri/255.0;cg=gi/255.0;cb=bi/255.0; }
-        }
-        else if (strcmp(argv[i],"--alpha")==0&&i+1<argc) ca=atof(argv[++i]);
-        else if (strcmp(argv[i],"--width")==0&&i+1<argc) width=atof(argv[++i]);
-        else if (strcmp(argv[i],"--length")==0&&i+1<argc) length_ms=(uint64_t)atoi(argv[++i]);
-        else if (strcmp(argv[i],"--min-speed")==0&&i+1<argc) min_speed=atof(argv[++i]);
-        else if (strcmp(argv[i],"--smooth-factor")==0&&i+1<argc) { smooth_factor=atof(argv[++i]); if(smooth_factor<0)smooth_factor=0; if(smooth_factor>1)smooth_factor=1; }
-        else if (strcmp(argv[i],"--color-cycle")==0&&i+1<argc) color_cycle_on=(strcmp(argv[++i],"on")==0);
-        else if (strcmp(argv[i],"--cycle-speed")==0&&i+1<argc) cycle_speed=atof(argv[++i]);
-        else if (strcmp(argv[i],"--socket")==0&&i+1<argc) socket_path=argv[++i];
-        else if (strcmp(argv[i],"--log-level")==0&&i+1<argc) {
-            const char *l=argv[++i];
-            if(strcmp(l,"debug")==0)log_level=0; else if(strcmp(l,"info")==0)log_level=1;
-            else if(strcmp(l,"warn")==0)log_level=2; else if(strcmp(l,"error")==0)log_level=3;
-        }
-        else if (strcmp(argv[i],"--log-file")==0&&i+1<argc) log_path=argv[++i];
-        else if (strcmp(argv[i],"--ctl")==0&&i+1<argc) ctl_cmd=argv[++i];
-        else { fprintf(stderr,"Unknown: %s\n",argv[i]); usage(argv[0]); return 1; }
+    /* Locate the config before applying CLI overrides, regardless of option order. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0) { usage(argv[0]); return 0; }
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+            config_path = argv[++i];
+        else if (strncmp(argv[i], "--", 2) == 0 && i + 1 < argc &&
+                 strcmp(argv[i], "--config") != 0) i++;
     }
-
-    /* Load config file (default: ~/.config/mouse-trail/config) */
     if (!config_path) {
         const char *home = getenv("HOME");
         static char def_cfg[512];
@@ -937,13 +1232,40 @@ int main(int argc, char *argv[]) {
         else snprintf(def_cfg, sizeof(def_cfg), "/tmp/mouse-trail-config");
         config_path = def_cfg;
     }
-    /* Save CLI values before config overrides */
-    const char *cli_device = device_path;
-    const char *cli_kbd = kbd_device_path;
-    parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms, &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed, &trail_style_comet, &device_path, &kbd_device_path);
-    /* CLI values take priority over config */
-    if (cli_device && strcmp(cli_device, "/dev/input/event2") != 0) device_path = cli_device;
-    if (cli_kbd) kbd_device_path = cli_kbd;
+    parse_config(config_path, &cr, &cg, &cb, &ca, &width, &length_ms,
+                 &min_speed, &smooth_factor, &color_cycle_on, &cycle_speed,
+                 &trail_style_comet, &device_path, &kbd_device_path);
+
+    for (int i = 1; i < argc; i++) {
+        const char *opt = argv[i];
+        if (strcmp(opt, "--config") == 0 && i + 1 < argc) { i++; continue; }
+        if (i + 1 >= argc) { fprintf(stderr, "Missing value for %s\n", opt); return 1; }
+        const char *val = argv[++i];
+        int valid = 1;
+        if (strcmp(opt, "--device") == 0) device_path = val;
+        else if (strcmp(opt, "--kbd-device") == 0) kbd_device_path = val;
+        else if (strcmp(opt, "--color") == 0) valid = parse_color(val, &cr, &cg, &cb);
+        else if (strcmp(opt, "--alpha") == 0) valid = parse_number(val, 0.0, 1.0, &ca);
+        else if (strcmp(opt, "--width") == 0) valid = parse_number(val, 0.01, 1000.0, &width);
+        else if (strcmp(opt, "--length") == 0) valid = parse_duration(val, &length_ms);
+        else if (strcmp(opt, "--min-speed") == 0) valid = parse_number(val, 0.0, 1000.0, &min_speed);
+        else if (strcmp(opt, "--smooth-factor") == 0) valid = parse_number(val, 0.0, 1.0, &smooth_factor);
+        else if (strcmp(opt, "--color-cycle") == 0) {
+            valid = strcmp(val, "on") == 0 || strcmp(val, "off") == 0;
+            if (valid) color_cycle_on = strcmp(val, "on") == 0;
+        } else if (strcmp(opt, "--cycle-speed") == 0) valid = parse_number(val, 0.01, 86400.0, &cycle_speed);
+        else if (strcmp(opt, "--socket") == 0) socket_path = val;
+        else if (strcmp(opt, "--log-level") == 0) {
+            if (strcmp(val, "debug") == 0) log_level = 0;
+            else if (strcmp(val, "info") == 0) log_level = 1;
+            else if (strcmp(val, "warn") == 0) log_level = 2;
+            else if (strcmp(val, "error") == 0) log_level = 3;
+            else valid = 0;
+        } else if (strcmp(opt, "--log-file") == 0) log_path = val;
+        else if (strcmp(opt, "--ctl") == 0) ctl_cmd = val;
+        else valid = 0;
+        if (!valid) { fprintf(stderr, "Invalid option: %s %s\n", opt, val); return 1; }
+    }
 
     /* Default keyboard device — NULL means auto-detect */
     /* (no default, NULL triggers auto-detect below) */
@@ -971,7 +1293,7 @@ int main(int argc, char *argv[]) {
                             libevdev_has_event_type(evdev[0], EV_ABS) &&
                             libevdev_has_event_code(evdev[0], EV_ABS, ABS_X) &&
                             libevdev_has_event_code(evdev[0], EV_ABS, ABS_Y);
-                abs_has_pos[0] = 0;
+                abs_has_x[0] = abs_has_y[0] = 0;
                 abs_last_x[0]=0; abs_last_y[0]=0;
                 abs_pending_dx[0]=0; abs_pending_dy[0]=0;
                 LOG_INFO("Configured: %s (%s)", libevdev_get_name(evdev[0]), device_path);
@@ -986,6 +1308,18 @@ int main(int argc, char *argv[]) {
                 snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
                 int tfd = open(trypath, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
                 if (tfd < 0) continue;
+                struct stat candidate;
+                if (fstat(tfd, &candidate) < 0) { close(tfd); continue; }
+                int already_open = 0;
+                for (int m = 0; m < num_mice; m++) {
+                    struct stat existing;
+                    if (fstat(input_fd[m], &existing) == 0 &&
+                        candidate.st_rdev == existing.st_rdev &&
+                        candidate.st_dev == existing.st_dev) {
+                        already_open = 1; break;
+                    }
+                }
+                if (already_open) { close(tfd); continue; }
                 struct libevdev *tdev = NULL;
                 if (libevdev_new_from_fd(tfd, &tdev) == 0) {
                     int is_mouse = 0, is_absdev = 0;
@@ -1027,7 +1361,8 @@ int main(int argc, char *argv[]) {
                                     evdev[k] = evdev[k+1]; input_fd[k] = input_fd[k+1];
                                     is_abs[k] = is_abs[k+1];
                                     abs_last_x[k] = abs_last_x[k+1]; abs_last_y[k] = abs_last_y[k+1];
-                                    abs_has_pos[k] = abs_has_pos[k+1];
+                                    abs_has_x[k] = abs_has_x[k+1];
+                                    abs_has_y[k] = abs_has_y[k+1];
                                     abs_pending_dx[k]=abs_pending_dx[k+1]; abs_pending_dy[k]=abs_pending_dy[k+1];
                                 }
                                 num_mice--;
@@ -1038,7 +1373,7 @@ int main(int argc, char *argv[]) {
                         is_abs[num_mice] = is_absdev;
                         abs_last_x[num_mice] = 0;
                         abs_last_y[num_mice] = 0;
-                        abs_has_pos[num_mice] = 0;
+                        abs_has_x[num_mice] = abs_has_y[num_mice] = 0;
                         abs_pending_dx[num_mice] = 0;
                         abs_pending_dy[num_mice] = 0;
                         LOG_INFO("Auto-detected %s #%d: %s (%s)",
@@ -1108,6 +1443,10 @@ int main(int argc, char *argv[]) {
     if (pointer) wl_pointer_add_listener(pointer, &pointer_listener, NULL);
     wl_display_roundtrip(display); /* output geometry/mode/scale */
 
+    /* Refuse a second instance before it can map a full-input overlay. */
+    for (int i = 0; i < MAX_CLIENTS; i++) clients[i].fd = -1;
+    if (setup_control_socket(socket_path) < 0) return 1;
+
     for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
         o->surface=wl_compositor_create_surface(compositor);
         o->layer_surface=zwlr_layer_shell_v1_get_layer_surface(layer_shell,o->surface,o->wl_output,ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,"mouse-trail");
@@ -1121,21 +1460,9 @@ int main(int argc, char *argv[]) {
     double est_x = outputs[0].global_x + outputs[0].width / 2.0;
     double est_y = outputs[0].global_y + outputs[0].height / 2.0;
 
-    /* Map surfaces with transparent frames */
-    for(int i=0;i<num_outputs;i++){ output_t*o=&outputs[i];
-        if(!o->configured||o->width<=0)continue;
-        int stride=o->width*4, size=stride*o->height;
-        int fd=memfd_create("init",MFD_CLOEXEC|MFD_ALLOW_SEALING);
-        if(fd<0) continue;
-        if(ftruncate(fd,size) < 0) { close(fd); continue; }
-        void*d=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-        if(d==MAP_FAILED){close(fd);continue;} memset(d,0,size);
-        struct wl_shm_pool*p=wl_shm_create_pool(shm,fd,size);
-        struct wl_buffer*b=wl_shm_pool_create_buffer(p,0,o->width,o->height,stride,WL_SHM_FORMAT_ARGB8888);
-        wl_shm_pool_destroy(p);close(fd);
-        wl_surface_attach(o->surface,b,0,0);
-        wl_surface_damage_buffer(o->surface,0,0,o->width,o->height);
-        wl_surface_commit(o->surface); wl_buffer_destroy(b); munmap(d,size); }
+    /* Map transparent frames using the same release-managed buffers as rendering. */
+    for (int i = 0; i < num_outputs; i++)
+        render_output(&outputs[i], &trail);
     wl_display_roundtrip(display);
 
     /* Give the compositor a few immediate chances to deliver enter. If the
@@ -1158,7 +1485,6 @@ int main(int argc, char *argv[]) {
     LOG_INFO("Position: (%.0f,%.0f), %d outputs%s", est_x, est_y, num_outputs,
              cursor_captured ? " (captured)" : " (initial estimate; capture pending)");
 
-    setup_control_socket(socket_path);
     start_time_ms = get_time_ms();
     pthread_create(&input_thread, NULL, input_thread_fn, NULL);
     if (num_kbd > 0) {
@@ -1214,8 +1540,8 @@ int main(int argc, char *argv[]) {
             atomic_store(&running, 0);
             break;
         }
-        struct epoll_event events[8];
-        int n = epoll_wait(epfd, events, 8, 10);
+        struct epoll_event events[32];
+        int n = epoll_wait(epfd, events, 32, 10);
         if (n < 0 && errno == EINTR) {
             if (prepared) wl_display_cancel_read(display);
             continue;
@@ -1250,29 +1576,40 @@ int main(int argc, char *argv[]) {
                 pthread_mutex_lock(&input_mutex);
                 if (color_cycle_on) {
                     double t = fmod((double)(now-start_time_ms)/1000.0/cycle_speed, 1.0);
-                    double rr,gg,bb; hsl_to_rgb(t,1.0,0.5,&rr,&gg,&bb);
-                    trail_set_color_rgb(&trail, rr, gg, bb);
+                    hsl_to_rgb(t,1.0,0.5,&trail.r,&trail.g,&trail.b);
                 }
+                int had_points = trail.count > 0;
                 int alive = trail_cleanup(&trail, now);
-                int redraw = atomic_exchange(&need_redraw, 0);
+                int redraw = atomic_exchange(&need_redraw, 0) || (had_points && !alive);
                 pthread_mutex_unlock(&input_mutex);
 
                 if (alive > 0 || redraw) render_all();
-            } else if (ctrl_fd>=0 && events[i].data.fd == ctrl_fd) {
-                int client = accept(ctrl_fd, NULL, NULL);
-                if (client >= 0) { char buf[256]; ssize_t nr = read(client,buf,sizeof(buf)-1);
-                    if (nr>0) { buf[nr]='\0'; if(buf[nr-1]=='\n')buf[nr-1]='\0'; handle_control_msg(buf); }
-                    close(client); }
+                for (int c = 0; c < MAX_CLIENTS; c++)
+                    if (clients[c].fd >= 0 && now - clients[c].connected_ms > 2000)
+                        finish_control_client(epfd, &clients[c], 0);
+            } else if (ctrl_fd >= 0 && events[i].data.fd == ctrl_fd) {
+                accept_control_clients(epfd);
+            } else {
+                for (int c = 0; c < MAX_CLIENTS; c++)
+                    if (clients[c].fd == events[i].data.fd) {
+                        read_control_client(epfd, &clients[c]);
+                        break;
+                    }
             }
         }
     }
 
     int should_restart = atomic_load(&restart_requested);
     LOG_INFO("Shutting down%s", should_restart ? " for restart" : "");
-    wl_display_roundtrip(display);
+    /* Never block on a roundtrip while shutting down a stalled compositor. */
     pthread_cancel(input_thread); pthread_join(input_thread, NULL);
     if (num_kbd > 0) { pthread_cancel(kbd_thread); pthread_join(kbd_thread, NULL); }
-    for(int i=0;i<num_outputs;i++){ if(outputs[i].layer_surface)zwlr_layer_surface_v1_destroy(outputs[i].layer_surface); if(outputs[i].surface)wl_surface_destroy(outputs[i].surface); if(outputs[i].wl_output)wl_output_destroy(outputs[i].wl_output); }
+    for (int i = 0; i < num_outputs; i++) {
+        for (int j = 0; j < BUFFER_SLOTS; j++) destroy_buffer_slot(&outputs[i].buffers[j]);
+        if (outputs[i].layer_surface) zwlr_layer_surface_v1_destroy(outputs[i].layer_surface);
+        if (outputs[i].surface) wl_surface_destroy(outputs[i].surface);
+        if (outputs[i].wl_output) wl_output_destroy(outputs[i].wl_output);
+    }
     if(pointer) wl_pointer_destroy(pointer);
     if(seat) wl_seat_destroy(seat);
     if(compositor) wl_compositor_destroy(compositor);
@@ -1282,7 +1619,9 @@ int main(int argc, char *argv[]) {
     if(display) wl_display_disconnect(display);
     for(int m=0; m<num_mice; m++){ if(evdev[m]) libevdev_free(evdev[m]); if(input_fd[m] >= 0) close(input_fd[m]); }
     for (int k = 0; k < num_kbd; k++) { if (kbd_evdev[k]) libevdev_free(kbd_evdev[k]); if (kbd_fd[k] >= 0) close(kbd_fd[k]); }
-    if(ctrl_fd >= 0) { close(ctrl_fd); unlink(socket_path); }
+    for (int c = 0; c < MAX_CLIENTS; c++)
+        if (clients[c].fd >= 0) close_control_client(epfd, &clients[c]);
+    if (ctrl_fd >= 0) { close(ctrl_fd); if (owns_control_socket) unlink(socket_path); }
     if(timer_fd >= 0) close(timer_fd);
     if(epfd >= 0) close(epfd);
     if(g_log_file && g_log_file != stderr) fclose(g_log_file);
