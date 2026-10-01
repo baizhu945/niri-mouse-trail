@@ -93,12 +93,12 @@ fi
 finish_server
 pass 'IPC rejects ERR'
 
-# main.c parses import=... then restores --device from CLI. Trace only file
-# syscalls with a deliberately nonexistent Wayland socket: even if this host
-# has readable input devices, the compositor cannot be touched.
+# Trace config reads and check the selected parameters in startup logs.
+# With a nonexistent Wayland socket, the hotplug manager is never started:
+# no overlay is mapped and no real input devices are opened.
 mkdir -p "$WORK/home/.config/mouse-trail"
 printf 'device=%s\n' "$WORK/import-device" > "$WORK/import.conf"
-printf 'import=%s\ndevice=%s\n' "$WORK/import.conf" "$WORK/config-device" > "$WORK/home/.config/mouse-trail/config"
+printf 'import=%s\ndevice=%s\nwidth=4\n' "$WORK/import.conf" "$WORK/config-device" > "$WORK/home/.config/mouse-trail/config"
 trace_start() {
     local trace=$1; shift
     local status=0
@@ -112,14 +112,18 @@ trace_start() {
 
 trace_start "$WORK/config.trace"
 grep -Fq "$WORK/import.conf" "$WORK/config.trace" || fail 'config import not read'
-grep -Fq "$WORK/config-device" "$WORK/config.trace" || fail 'config device not applied'
+grep -Fq "mouse=$WORK/config-device " "$WORK/run.out" || fail 'config device not applied'
 pass 'default config and imported file are parsed'
 
 trace_start "$WORK/cli.trace" --config "$WORK/home/.config/mouse-trail/config" --device "$WORK/cli-device"
-grep -Fq "$WORK/cli-device" "$WORK/cli.trace" || fail '--device not applied'
-if grep -Fq "$WORK/config-device" "$WORK/cli.trace"; then
+grep -Fq "mouse=$WORK/cli-device " "$WORK/run.out" || fail '--device not applied'
+if grep -Fq "mouse=$WORK/config-device " "$WORK/run.out"; then
     fail 'config device incorrectly overrides CLI device'
 fi
 pass 'CLI device overrides config device'
+
+trace_start "$WORK/width.trace" --width 17 --config "$WORK/home/.config/mouse-trail/config"
+grep -Fq 'trail_init: width=17.00' "$WORK/run.out" || fail 'config width overrides CLI width'
+pass 'CLI width overrides config regardless of option order'
 
 echo 'All isolated mouse-trail tests passed.'

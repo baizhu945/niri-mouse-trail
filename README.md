@@ -38,7 +38,7 @@ Before using mouse-trail, ensure your system meets these prerequisites:
   }
   ```
 - **evtest** (optional, for debugging input devices): `nix-shell -p evtest`
-- **Dependencies for manual compilation**: `wayland`, `wayland-protocols`, `wlroots`, `cairo`, `libevdev`, `pkg-config`, `gcc`
+- **Dependencies for manual compilation**: `wayland`, `wayland-protocols`, `wlroots`, `cairo`, `libevdev`, `libudev`, `pkg-config`, `gcc`
 
 ---
 
@@ -55,6 +55,7 @@ Before using mouse-trail, ensure your system meets these prerequisites:
 - **Meteor-like trail**: head is bright and wide, tail fades cubically and tapers quadratically
 - **Two visual styles**: smooth comet-line (default) or discrete fading dots (configurable)
 - **Multi-monitor**: creates independent layer surfaces for each output
+- **Input hotplug**: udev add/remove monitoring reconnects mice and keyboards without restarting the overlay; invalid handles are removed immediately, with periodic recovery retries
 - **Real-time control**: change color, width, opacity, speed via Unix socket
 - **HSL color cycling**: continuous rainbow trail with configurable cycle speed
 - **Near-full click passthrough after calibration**: a thin center ring can intercept clicks; before the first cursor capture, the full-surface region can intercept input (see warning above)
@@ -94,11 +95,16 @@ This installs `mouse-trail`, `mouse-trail-toggle`, `mouse-trail-ctl`, and `mouse
 ### Manual compilation
 
 ```bash
-# Dependencies: wayland, wayland-protocols, wlroots, cairo, libevdev, pkg-config, gcc
+# Dependencies: wayland, wayland-protocols, wlroots, cairo, libevdev, libudev, pkg-config, gcc
 make
 ```
 
 The binary will be at `./mouse-trail`.
+
+`make test` runs isolated trail and input-lifecycle regression tests. `make input-probe`
+additionally opens readable input devices without mapping an overlay or injecting input;
+it reports interval CPU usage and checks that shutdown releases all descriptors.
+Physical unplug/replug testing still requires access to the actual devices.
 
 ---
 
@@ -263,8 +269,8 @@ Only the 2px-thin hollow square receives pointer events. Everything inside and o
 ## Architecture
 
 ```
-┌─ Input Thread (poll() all detected mice/touchpads)
-├─ Keyboard Thread (hotkey detection, auto-detected)
+┌─ Input Manager (one thread: poll() input devices + udev monitor + shutdown eventfd)
+├─ Mouse/touchpad motion and keyboard hotkey callbacks
                            │
                      trail.pos_x, trail.pos_y
                      trail ring buffer (absolute global coords)
@@ -291,7 +297,8 @@ mouse-trail/
 ├── src/
 │   ├── log.h                              # Timestamped logging macros
 │   ├── trail.h / trail.c                  # Trail state, ring buffer, cleanup
-│   ├── main.c                             # Wayland, Cairo, input, control, CLI
+│   ├── main.c                             # Wayland, Cairo, callbacks, control, CLI
+│   ├── input.h / input.c                  # Input hotplug, device lifecycle, modifier state
 │   ├── wlr-layer-shell-client-protocol.h/c # Pre-generated wlr-layer-shell v1
 │   └── xdg-shell-client-protocol.c        # Pre-generated xdg-shell (dependency)
 ├── mouse-trail.nix                        # Nix home-manager module
@@ -311,7 +318,8 @@ mouse-trail/
 | `wayland-protocols` | xdg-shell protocol |
 | `wlroots` | wlr-layer-shell protocol (XML for code generation) |
 | `cairo` | 2D rendering on shared memory buffers |
-| `libevdev` | Raw mouse input event reading |
+| `libevdev` | Raw mouse and keyboard input event reading |
+| `libudev` | Input device enumeration and hotplug monitoring |
 
 ---
 

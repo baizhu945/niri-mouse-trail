@@ -37,7 +37,7 @@
   }
   ```
 - **evtest**（可选，用于调试输入设备）：`nix-shell -p evtest`
-- **手动编译依赖**：`wayland`、`wayland-protocols`、`wlroots`、`cairo`、`libevdev`、`pkg-config`、`gcc`
+- **手动编译依赖**：`wayland`、`wayland-protocols`、`wlroots`、`cairo`、`libevdev`、`libudev`、`pkg-config`、`gcc`
 
 ---
 
@@ -54,6 +54,7 @@
 - **流星尾迹**：头部亮且宽，尾部随 t³ 渐隐、(1−t)² 渐细
 - **两种视觉风格**：流畅彗星线（默认）或离散渐隐小球（可配置）
 - **多显示器**：为每个输出创建独立的 layer surface
+- **输入设备热插拔**：通过 udev 监视鼠标、键盘的接入和移除，无需重启覆盖层；失效句柄立即撤销监听，并定期重试恢复设备
 - **实时控制**：通过 Unix socket 实时切换颜色、宽度、透明度、速度
 - **HSL 彩虹循环**：连续彩虹色拖尾，可调节循环速度
 - **校准后大部分区域点击透传**：中心细环仍可能拦截点击；初次捕获光标前，全表面输入区域也可能拦截点击（见上方警告）
@@ -93,11 +94,16 @@ home-manager switch
 ### 手动编译
 
 ```bash
-# 依赖：wayland, wayland-protocols, wlroots, cairo, libevdev, pkg-config, gcc
+# 依赖：wayland, wayland-protocols, wlroots, cairo, libevdev, libudev, pkg-config, gcc
 make
 ```
 
 生成的可执行文件为 `./mouse-trail`。
+
+`make test` 运行隔离的轨迹与输入设备生命周期回归测试。`make input-probe`
+会另外以只读方式打开有权限的输入设备，不创建覆盖层、不注入鼠标或按键；
+报告区间 CPU 占用，并检查退出后是否释放全部文件描述符。
+实际拔插设备的测试仍需在硬件上进行。
 
 ---
 
@@ -261,7 +267,8 @@ Wayland 刻意阻止客户端查询全局光标位置。这是一项安全特性
 ## 架构
 
 ```
-所有自动检测到的输入设备 ──► 输入线程（poll，逐事件钳制）
+所有自动检测到的输入设备 ──► 输入管理线程（poll，逐事件钳制）
+udev 热插拔监视 ──────────► 同一线程增删设备、清除失效句柄
                            │
                      trail.pos_x, trail.pos_y
                      轨迹环形缓冲区（绝对全局坐标）
@@ -288,7 +295,8 @@ mouse-trail/
 ├── src/
 │   ├── log.h                              # 带时间戳的日志宏
 │   ├── trail.h / trail.c                  # 轨迹状态、环形缓冲区、清理
-│   ├── main.c                             # Wayland、Cairo、输入、控制、CLI
+│   ├── main.c                             # Wayland、Cairo、输入回调、控制、CLI
+│   ├── input.h / input.c                  # 热插拔、设备生命周期、修饰键状态
 │   ├── wlr-layer-shell-client-protocol.h/c # 预生成的 wlr-layer-shell v1
 │   ├── xdg-shell-client-protocol.c        # 预生成的 xdg-shell（依赖项）
 │   └── relative-pointer-client-protocol.h/c # 已生成（未使用，保留参考）
@@ -309,7 +317,8 @@ mouse-trail/
 | `wayland-protocols` | xdg-shell 协议 |
 | `wlroots` | wlr-layer-shell 协议（代码生成的 XML 源文件） |
 | `cairo` | 共享内存缓冲区上的 2D 渲染 |
-| `libevdev` | 原始鼠标输入事件读取 |
+| `libevdev` | 原始鼠标和键盘输入事件读取 |
+| `libudev` | 输入设备枚举与热插拔监视 |
 
 ---
 

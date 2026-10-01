@@ -19,19 +19,30 @@ let
     };
 
     nativeBuildInputs = with pkgs; [ pkg-config ];
-    buildInputs = with pkgs; [ wayland cairo libevdev ];
+    buildInputs = with pkgs; [ wayland cairo libevdev systemd ];
 
     buildPhase = ''
       mkdir -p build
-      CFLAGS="$NIX_CFLAGS_COMPILE $(pkg-config --cflags wayland-client cairo libevdev) -Wall -Wextra -O2 -g -Isrc"
-      LIBS="$(pkg-config --libs wayland-client cairo libevdev) -lm"
+      CFLAGS="$NIX_CFLAGS_COMPILE $(pkg-config --cflags wayland-client cairo libevdev libudev) -Wall -Wextra -O2 -g -Isrc -pthread"
+      LIBS="$(pkg-config --libs wayland-client cairo libevdev libudev) -lm -pthread"
 
+      gcc $CFLAGS -c src/input.c -o build/input.o
       gcc $CFLAGS -c src/trail.c -o build/trail.o
       gcc $CFLAGS -c src/wlr-layer-shell-client-protocol.c -o build/wlr-layer-shell.o
       gcc $CFLAGS -c src/xdg-shell-client-protocol.c -o build/xdg-shell.o
       gcc $CFLAGS -c src/main.c -o build/main.o
-      gcc build/trail.o build/wlr-layer-shell.o build/xdg-shell.o build/main.o \
+      gcc build/input.o build/trail.o build/wlr-layer-shell.o build/xdg-shell.o build/main.o \
         -o mouse-trail $LIBS
+    '';
+
+    doCheck = true;
+    checkPhase = ''
+      runHook preCheck
+      gcc $CFLAGS -DTRAIL_TEST src/trail.c -o build/trail_test -lm
+      build/trail_test
+      gcc $CFLAGS -DINPUT_TEST src/input.c -o build/input_test $LIBS
+      build/input_test
+      runHook postCheck
     '';
 
     installPhase = ''

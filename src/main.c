@@ -3,10 +3,10 @@
 #endif
 #include "log.h"
 #include "trail.h"
+#include "input.h"
 #include "wlr-layer-shell-client-protocol.h"
 #include <wayland-client.h>
 #include <cairo/cairo.h>
-#include <libevdev/libevdev.h>
 #include <math.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -76,20 +76,7 @@ static struct wl_surface *current_pointer_surface = NULL;
 static trail_state_t trail;
 static uint64_t start_time_ms = 0;
 
-#define MAX_MICE 8
-static struct libevdev *evdev[MAX_MICE];
-static int input_fd[MAX_MICE];
-static int is_abs[MAX_MICE];
-static double abs_last_x[MAX_MICE];
-static double abs_last_y[MAX_MICE];
-static int abs_has_x[MAX_MICE], abs_has_y[MAX_MICE];
-static double abs_pending_dx[MAX_MICE];
-static double abs_pending_dy[MAX_MICE];
-static int num_mice = 0;
-static struct libevdev *kbd_evdev[MAX_MICE];
-static int kbd_fd[MAX_MICE];
-static int num_kbd = 0;
-static pthread_t input_thread, kbd_thread;
+static struct input_manager *inputs = NULL;
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int ctrl_fd = -1;
@@ -246,7 +233,12 @@ static void output_geometry(void *data, struct wl_output *wo,
     int32_t subpixel, const char *make, const char *model, int32_t transform) {
     (void)data;(void)pw;(void)ph;(void)subpixel;(void)make;(void)model;(void)transform;
     for (int i = 0; i < num_outputs; i++)
-        if (outputs[i].wl_output == wo) { outputs[i].global_x = x; outputs[i].global_y = y; return; }
+        if (outputs[i].wl_output == wo) {
+            pthread_mutex_lock(&input_mutex);
+            outputs[i].global_x = x; outputs[i].global_y = y;
+            pthread_mutex_unlock(&input_mutex);
+            return;
+        }
 }
 static void output_mode(void *data, struct wl_output *wo,
     uint32_t flags, int32_t w, int32_t h, int32_t refresh) {
@@ -345,8 +337,8 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
     }
     else if (strcmp(interface, wl_output_interface.name) == 0) {
         if (num_outputs < MAX_OUTPUTS) {
-            if (outputs_locked && running) {
-                request_restart("new output detected");
+            if (outputs_locked) {
+                if (atomic_load(&running)) request_restart("new output detected");
                 return;
             }
             if (version < 2) { LOG_ERROR("wl_output v2 required (server offers v%u)", version); return; }
@@ -370,7 +362,9 @@ static void registry_global_remove(void *data, struct wl_registry *reg, uint32_t
     (void)data;(void)reg;
     for (int i = 0; i < num_outputs; i++) {
         if (outputs[i].wl_output && outputs[i].registry_name == name) {
+            pthread_mutex_lock(&input_mutex);
             outputs[i].removed = 1;
+            pthread_mutex_unlock(&input_mutex);
             LOG_INFO("Output %d removed", i);
             return;
         }
@@ -383,6 +377,7 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *s,
     (void)data; zwlr_layer_surface_v1_ack_configure(s, serial);
     for (int i = 0; i < num_outputs; i++)
         if (outputs[i].layer_surface == s) {
+            pthread_mutex_lock(&input_mutex);
             if (outputs[i].width != (int)w || outputs[i].height != (int)h) {
                 outputs[i].has_committed = 0;
                 outputs[i].damage_w = outputs[i].damage_h = 0;
@@ -401,6 +396,7 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *s,
             LOG_INFO("Output %d: logical=%dx%d phys=%dx%d scale=%.2f",
                      i, outputs[i].cursor_width, outputs[i].cursor_height,
                      outputs[i].phys_w, outputs[i].phys_h, outputs[i].scale);
+            pthread_mutex_unlock(&input_mutex);
             return;
         }
 }
@@ -408,8 +404,10 @@ static void layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *s) {
     (void)data;
     for (int i = 0; i < num_outputs; i++) {
         if (outputs[i].layer_surface == s) {
+            pthread_mutex_lock(&input_mutex);
             outputs[i].removed = 1;
             outputs[i].configured = 0;
+            pthread_mutex_unlock(&input_mutex);
             zwlr_layer_surface_v1_destroy(s);
             outputs[i].layer_surface = NULL;
             LOG_INFO("Layer surface %d closed, destroyed", i);
@@ -717,7 +715,9 @@ static void finish_control_client(int epfd, control_client_t *client, int comple
         client->message[client->used] = '\0';
         char *newline = strchr(client->message, '\n');
         if (newline) *newline = '\0';
+        pthread_mutex_lock(&input_mutex);
         ok = handle_control_msg(client->message);
+        pthread_mutex_unlock(&input_mutex);
     }
     const char *response = ok ? "OK\n" : "ERR\n";
     (void)send(client->fd, response, strlen(response), MSG_NOSIGNAL | MSG_DONTWAIT);
@@ -771,92 +771,22 @@ static void read_control_client(int epfd, control_client_t *client) {
     }
 }
 
-static void process_input_event(int m, const struct input_event *ev) {
-    if (ev->type == EV_REL && !is_abs[m] &&
-        (ev->code == REL_X || ev->code == REL_Y)) {
-        double dx = (ev->code == REL_X) ? (double)ev->value : 0.0;
-        double dy = (ev->code == REL_Y) ? (double)ev->value : 0.0;
-        pthread_mutex_lock(&input_mutex);
-        apply_cursor_delta_locked(dx, dy, get_time_ms());
-        pthread_mutex_unlock(&input_mutex);
-    } else if (ev->type == EV_ABS && is_abs[m] &&
-               (ev->code == ABS_X || ev->code == ABS_Y)) {
-        double *last = (ev->code == ABS_X) ? &abs_last_x[m] : &abs_last_y[m];
-        double *pending = (ev->code == ABS_X) ? &abs_pending_dx[m] : &abs_pending_dy[m];
-        double cur = (double)ev->value;
-        int *has_pos = (ev->code == ABS_X) ? &abs_has_x[m] : &abs_has_y[m];
-        if (!*has_pos) { *last = cur; *has_pos = 1; }
-        else if (cur != *last) {
-            *pending += cur - *last;
-            *last = cur;
-        }
-    } else if (ev->type == EV_SYN && ev->code == SYN_REPORT && is_abs[m]) {
-        /* Apply accumulated ABS deltas on SYN_REPORT, scaled to logical px. */
-        double dx = abs_pending_dx[m], dy = abs_pending_dy[m];
-        abs_pending_dx[m] = 0;
-        abs_pending_dy[m] = 0;
-        /* Each ABS axis can report independently; the first event of each
-         * establishes its own baseline, with no cross-axis dependency. */
-        int ax = libevdev_get_abs_maximum(evdev[m], ABS_X) -
-                 libevdev_get_abs_minimum(evdev[m], ABS_X);
-        int ay = libevdev_get_abs_maximum(evdev[m], ABS_Y) -
-                 libevdev_get_abs_minimum(evdev[m], ABS_Y);
-        if (ax > 0 && outputs[0].width > 0)
-            dx = dx / (double)ax * (double)outputs[0].width;
-        if (ay > 0 && outputs[0].height > 0)
-            dy = dy / (double)ay * (double)outputs[0].height;
-        pthread_mutex_lock(&input_mutex);
-        apply_cursor_delta_locked(dx, dy, get_time_ms());
-        pthread_mutex_unlock(&input_mutex);
-    } else if (ev->type == EV_KEY && is_abs[m] &&
-               ev->code == BTN_TOUCH && ev->value == 0) {
-        abs_has_x[m] = abs_has_y[m] = 0;
-        abs_pending_dx[m] = 0;
-        abs_pending_dy[m] = 0;
-    }
-}
-
-static void drain_mouse_device(int m) {
-    struct input_event ev;
-    for (;;) {
-        int rc = libevdev_next_event(evdev[m], LIBEVDEV_READ_FLAG_NORMAL, &ev);
-        if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
-            process_input_event(m, &ev);
-            continue;
-        }
-        if (rc == LIBEVDEV_READ_STATUS_SYNC) {
-            LOG_WARN("Input queue overrun on device #%d; resynchronizing", m);
-            do {
-                rc = libevdev_next_event(evdev[m], LIBEVDEV_READ_FLAG_SYNC, &ev);
-                if (rc == LIBEVDEV_READ_STATUS_SYNC) process_input_event(m, &ev);
-            } while (rc == LIBEVDEV_READ_STATUS_SYNC);
-            if (rc == LIBEVDEV_READ_STATUS_SUCCESS) continue;
-        }
-        if (rc != -EAGAIN && rc != -EINTR && rc != -ENODEV)
-            LOG_WARN("Input device #%d stopped: %s", m, strerror(-rc));
-        return;
-    }
-}
-
-static void *input_thread_fn(void *arg) {
-    (void)arg;
-    struct pollfd fds[MAX_MICE];
-    for (int m = 0; m < num_mice; m++) {
-        fds[m].fd = input_fd[m];
-        fds[m].events = POLLIN;
-    }
-    while (atomic_load(&running)) {
-        int ready = poll(fds, num_mice, 50);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
+static void input_motion(void *user, double dx, double dy, int normalized) {
+    (void)user;
+    if (!atomic_load(&running)) return;
+    pthread_mutex_lock(&input_mutex);
+    if (normalized) {
+        /* Keep ABS sensitivity consistent with the previous primary-output
+         * mapping, with a fallback when that output has been removed. */
+        for (int i = 0; i < num_outputs; i++) {
+            if (outputs[i].removed || !outputs[i].configured) continue;
+            dx *= outputs[i].width;
+            dy *= outputs[i].height;
             break;
         }
-        for (int m = 0; m < num_mice; m++) {
-            if (fds[m].revents & (POLLIN | POLLERR | POLLHUP))
-                drain_mouse_device(m);
-        }
     }
-    return NULL;
+    apply_cursor_delta_locked(dx, dy, get_time_ms());
+    pthread_mutex_unlock(&input_mutex);
 }
 
 /* Key name to Linux key code mapping */
@@ -1022,86 +952,27 @@ static void detect_warp_bindings(void) {
     }
 }
 
-static void process_key_event(const struct input_event *ev, int *super_down,
-                               int *shift_down, int *ctrl_down, int *alt_down) {
-    if (ev->type != EV_KEY) return;
-    int pressed = ev->value == 1;
-    int released = ev->value == 0;
+static void input_key(void *user, const struct input_event *ev,
+                      const input_modifiers_t *mods) {
+    (void)user;
+    if (!atomic_load(&running) || ev->type != EV_KEY || ev->value != 1) return;
     switch (ev->code) {
         case KEY_LEFTMETA: case KEY_RIGHTMETA:
-            if (pressed) *super_down = 1; else if (released) *super_down = 0;
-            break;
         case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT:
-            if (pressed) *shift_down = 1; else if (released) *shift_down = 0;
-            break;
         case KEY_LEFTCTRL: case KEY_RIGHTCTRL:
-            if (pressed) *ctrl_down = 1; else if (released) *ctrl_down = 0;
-            break;
         case KEY_LEFTALT: case KEY_RIGHTALT:
-            if (pressed) *alt_down = 1; else if (released) *alt_down = 0;
-            break;
-        default:
-            if (!pressed) break;
-            for (int i = 0; i < num_warp_bindings; i++) {
-                warp_binding_t *wb = &warp_bindings[i];
-                if (ev->code == wb->key_code &&
-                    *super_down == wb->need_super &&
-                    *shift_down == wb->need_shift &&
-                    *ctrl_down  == wb->need_ctrl &&
-                    *alt_down   == wb->need_alt) {
-                    request_restart("monitor-switch hotkey");
-                    return;
-                }
-            }
-            break;
+            return;
+        default: break;
     }
-}
-
-static void drain_keyboard_device(int k, int *super_down, int *shift_down,
-                                  int *ctrl_down, int *alt_down) {
-    struct input_event ev;
-    for (;;) {
-        int rc = libevdev_next_event(kbd_evdev[k], LIBEVDEV_READ_FLAG_NORMAL, &ev);
-        if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
-            process_key_event(&ev, super_down, shift_down, ctrl_down, alt_down);
-            continue;
-        }
-        if (rc == LIBEVDEV_READ_STATUS_SYNC) {
-            LOG_WARN("Keyboard queue overrun on device #%d; resynchronizing", k);
-            do {
-                rc = libevdev_next_event(kbd_evdev[k], LIBEVDEV_READ_FLAG_SYNC, &ev);
-                if (rc == LIBEVDEV_READ_STATUS_SYNC)
-                    process_key_event(&ev, super_down, shift_down, ctrl_down, alt_down);
-            } while (rc == LIBEVDEV_READ_STATUS_SYNC);
-            if (rc == LIBEVDEV_READ_STATUS_SUCCESS) continue;
-        }
-        if (rc != -EAGAIN && rc != -EINTR && rc != -ENODEV)
-            LOG_WARN("Keyboard device #%d stopped: %s", k, strerror(-rc));
-        return;
-    }
-}
-
-/* Keyboard monitor: detect monitor-switch hotkeys and trigger recapture. */
-static void *kbd_thread_fn(void *arg) {
-    (void)arg;
-    int super_down = 0, shift_down = 0, ctrl_down = 0, alt_down = 0;
-    struct pollfd fds[MAX_MICE];
-    for (int k = 0; k < num_kbd; k++) {
-        fds[k].fd = kbd_fd[k];
-        fds[k].events = POLLIN;
-    }
-    while (atomic_load(&running)) {
-        int ready = poll(fds, num_kbd, 100);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        for (int k = 0; k < num_kbd; k++) {
-            if (fds[k].revents & (POLLIN | POLLERR | POLLHUP))
-                drain_keyboard_device(k, &super_down, &shift_down, &ctrl_down, &alt_down);
+    for (int i = 0; i < num_warp_bindings; i++) {
+        const warp_binding_t *wb = &warp_bindings[i];
+        if (ev->code == wb->key_code && mods->super == wb->need_super &&
+            mods->shift == wb->need_shift && mods->ctrl == wb->need_ctrl &&
+            mods->alt == wb->need_alt) {
+            request_restart("monitor-switch hotkey");
+            return;
         }
     }
-    return NULL;
 }
 
 static int send_control_cmd(const char *sock, const char *cmd) {
@@ -1278,160 +1149,12 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("mouse-trail v0.11");
 
-    /* Open mouse devices — try configured path, then auto-detect all matching */
-    {
-        /* Try configured device first */
-        if (device_path) {
-            int fd = open(device_path, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
-            if (fd >= 0 && libevdev_new_from_fd(fd, &evdev[0]) == 0) {
-                num_mice = 1;
-                input_fd[0] = fd;
-                int has_rel = libevdev_has_event_type(evdev[0], EV_REL) &&
-                              libevdev_has_event_code(evdev[0], EV_REL, REL_X) &&
-                              libevdev_has_event_code(evdev[0], EV_REL, REL_Y);
-                is_abs[0] = !has_rel &&
-                            libevdev_has_event_type(evdev[0], EV_ABS) &&
-                            libevdev_has_event_code(evdev[0], EV_ABS, ABS_X) &&
-                            libevdev_has_event_code(evdev[0], EV_ABS, ABS_Y);
-                abs_has_x[0] = abs_has_y[0] = 0;
-                abs_last_x[0]=0; abs_last_y[0]=0;
-                abs_pending_dx[0]=0; abs_pending_dy[0]=0;
-                LOG_INFO("Configured: %s (%s)", libevdev_get_name(evdev[0]), device_path);
-            } else {
-                if (fd >= 0) close(fd);
-            }
-        }
-
-        /* Always scan for additional/all devices */
-        char trypath[32];
-        for (int en = 0; en < 32 && num_mice < MAX_MICE; en++) {
-                snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
-                int tfd = open(trypath, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
-                if (tfd < 0) continue;
-                struct stat candidate;
-                if (fstat(tfd, &candidate) < 0) { close(tfd); continue; }
-                int already_open = 0;
-                for (int m = 0; m < num_mice; m++) {
-                    struct stat existing;
-                    if (fstat(input_fd[m], &existing) == 0 &&
-                        candidate.st_rdev == existing.st_rdev &&
-                        candidate.st_dev == existing.st_dev) {
-                        already_open = 1; break;
-                    }
-                }
-                if (already_open) { close(tfd); continue; }
-                struct libevdev *tdev = NULL;
-                if (libevdev_new_from_fd(tfd, &tdev) == 0) {
-                    int is_mouse = 0, is_absdev = 0;
-                    if (libevdev_has_event_type(tdev, EV_REL) &&
-                        libevdev_has_event_code(tdev, EV_REL, REL_X) &&
-                        libevdev_has_event_code(tdev, EV_REL, REL_Y) &&
-                        libevdev_has_event_type(tdev, EV_KEY) &&
-                        libevdev_has_event_code(tdev, EV_KEY, BTN_LEFT))
-                        is_mouse = 1;
-                    if (libevdev_has_event_type(tdev, EV_ABS) &&
-                        libevdev_has_event_code(tdev, EV_ABS, ABS_X) &&
-                        libevdev_has_event_code(tdev, EV_ABS, ABS_Y))
-                        is_absdev = 1;
-                    /* A mixed REL+ABS node is treated as REL. This avoids
-                     * integrating two coordinate streams from composite HID
-                     * devices; pure ABS nodes remain a fallback for touchpads. */
-                    if (is_mouse && is_absdev) is_absdev = 0;
-                    if (is_mouse || is_absdev) {
-                        /* Dedup pure ABS siblings when a REL interface exists. */
-                        const char *phys = libevdev_get_phys(tdev);
-                        if (phys && is_mouse) {
-                            int has_abs = 0;
-                            for (int m = 0; m < num_mice; m++)
-                                if (evdev[m] && libevdev_get_phys(evdev[m]) &&
-                                    strcmp(libevdev_get_phys(evdev[m]), phys) == 0 &&
-                                    is_abs[m]) { has_abs = 1; break; }
-                            if (has_abs) { libevdev_free(tdev); close(tfd); continue; }
-                        }
-                        if (phys && is_absdev) {
-                            int has_rel = 0, rel_idx = -1;
-                            for (int m = 0; m < num_mice; m++)
-                                if (evdev[m] && libevdev_get_phys(evdev[m]) &&
-                                    strcmp(libevdev_get_phys(evdev[m]), phys) == 0 &&
-                                    !is_abs[m]) { has_rel = 1; rel_idx = m; break; }
-                            if (has_rel) {
-                                /* Replace silent REL with ABS */
-                                libevdev_free(evdev[rel_idx]); close(input_fd[rel_idx]);
-                                for (int k = rel_idx; k < num_mice - 1; k++) {
-                                    evdev[k] = evdev[k+1]; input_fd[k] = input_fd[k+1];
-                                    is_abs[k] = is_abs[k+1];
-                                    abs_last_x[k] = abs_last_x[k+1]; abs_last_y[k] = abs_last_y[k+1];
-                                    abs_has_x[k] = abs_has_x[k+1];
-                                    abs_has_y[k] = abs_has_y[k+1];
-                                    abs_pending_dx[k]=abs_pending_dx[k+1]; abs_pending_dy[k]=abs_pending_dy[k+1];
-                                }
-                                num_mice--;
-                            }
-                        }
-                        evdev[num_mice] = tdev;
-                        input_fd[num_mice] = tfd;
-                        is_abs[num_mice] = is_absdev;
-                        abs_last_x[num_mice] = 0;
-                        abs_last_y[num_mice] = 0;
-                        abs_has_x[num_mice] = abs_has_y[num_mice] = 0;
-                        abs_pending_dx[num_mice] = 0;
-                        abs_pending_dy[num_mice] = 0;
-                        LOG_INFO("Auto-detected %s #%d: %s (%s)",
-                                 is_mouse ? "mouse" : "touchpad",
-                                 num_mice, libevdev_get_name(tdev), trypath);
-                        num_mice++;
-                        continue;
-                    }
-                    libevdev_free(tdev);
-                }
-                close(tfd);
-            }
-        }
-        if (num_mice == 0) { LOG_ERROR("No mouse found"); return 1; }
-
     trail_init(&trail, width, length_ms, min_speed, smooth_factor, cr, cg, cb, ca);
-
-    /* Open keyboard devices — config + auto-detect */
-    {
-        /* Try configured device first */
-        if (kbd_device_path) {
-            int fd = open(kbd_device_path, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
-            if (fd >= 0 && libevdev_new_from_fd(fd, &kbd_evdev[0]) == 0) {
-                num_kbd = 1;
-                kbd_fd[0] = fd;
-                LOG_INFO("Keyboard: %s (%s)", libevdev_get_name(kbd_evdev[0]), kbd_device_path);
-            } else {
-                if (fd >= 0) close(fd);
-            }
-        }
-
-        /* Auto-detect all keyboard devices */
-        char trypath[32];
-        for (int en = 0; en < 32 && num_kbd < MAX_MICE; en++) {
-            snprintf(trypath, sizeof(trypath), "/dev/input/event%d", en);
-            if (kbd_device_path && strcmp(trypath, kbd_device_path) == 0) continue;
-            int tfd = open(trypath, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
-            if (tfd < 0) continue;
-            struct libevdev *tdev = NULL;
-            if (libevdev_new_from_fd(tfd, &tdev) == 0) {
-                if (libevdev_has_event_type(tdev, EV_KEY) &&
-                    libevdev_has_event_code(tdev, EV_KEY, KEY_A) &&
-                    libevdev_has_event_code(tdev, EV_KEY, KEY_ESC)) {
-                    kbd_evdev[num_kbd] = tdev;
-                    kbd_fd[num_kbd] = tfd;
-                    LOG_INFO("Auto-detected keyboard #%d: %s (%s)", num_kbd, libevdev_get_name(tdev), trypath);
-                    num_kbd++;
-                    continue;
-                }
-                libevdev_free(tdev);
-            }
-            close(tfd);
-        }
-        if (num_kbd == 0) LOG_WARN("No keyboard found, warp hotkey detection disabled");
-    }
+    LOG_INFO("Input selection: mouse=%s keyboard=%s (plus auto-detected devices)",
+             device_path ? device_path : "auto", kbd_device_path ? kbd_device_path : "auto");
 
     display = wl_display_connect(NULL);
-    if (!display) { LOG_ERROR("Wayland connect failed"); for(int m=0;m<num_mice;m++){if(evdev[m])libevdev_free(evdev[m]);if(input_fd[m]>=0)close(input_fd[m]);} return 1; }
+    if (!display) { LOG_ERROR("Wayland connect failed"); return 1; }
 
     registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
@@ -1486,10 +1209,13 @@ int main(int argc, char *argv[]) {
              cursor_captured ? " (captured)" : " (initial estimate; capture pending)");
 
     start_time_ms = get_time_ms();
-    pthread_create(&input_thread, NULL, input_thread_fn, NULL);
-    if (num_kbd > 0) {
-        detect_warp_bindings();
-        pthread_create(&kbd_thread, NULL, kbd_thread_fn, NULL);
+    detect_warp_bindings();
+    inputs = input_manager_create(device_path, kbd_device_path, input_motion, input_key, NULL);
+    if (!inputs || input_manager_start(inputs) < 0) {
+        LOG_ERROR("Cannot start input device manager");
+        input_manager_destroy(inputs);
+        if (owns_control_socket) unlink(socket_path);
+        return 1;
     }
 
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK|TFD_CLOEXEC);
@@ -1602,8 +1328,8 @@ int main(int argc, char *argv[]) {
     int should_restart = atomic_load(&restart_requested);
     LOG_INFO("Shutting down%s", should_restart ? " for restart" : "");
     /* Never block on a roundtrip while shutting down a stalled compositor. */
-    pthread_cancel(input_thread); pthread_join(input_thread, NULL);
-    if (num_kbd > 0) { pthread_cancel(kbd_thread); pthread_join(kbd_thread, NULL); }
+    input_manager_destroy(inputs);
+    inputs = NULL;
     for (int i = 0; i < num_outputs; i++) {
         for (int j = 0; j < BUFFER_SLOTS; j++) destroy_buffer_slot(&outputs[i].buffers[j]);
         if (outputs[i].layer_surface) zwlr_layer_surface_v1_destroy(outputs[i].layer_surface);
@@ -1617,8 +1343,6 @@ int main(int argc, char *argv[]) {
     if(layer_shell) zwlr_layer_shell_v1_destroy(layer_shell);
     if(registry) wl_registry_destroy(registry);
     if(display) wl_display_disconnect(display);
-    for(int m=0; m<num_mice; m++){ if(evdev[m]) libevdev_free(evdev[m]); if(input_fd[m] >= 0) close(input_fd[m]); }
-    for (int k = 0; k < num_kbd; k++) { if (kbd_evdev[k]) libevdev_free(kbd_evdev[k]); if (kbd_fd[k] >= 0) close(kbd_fd[k]); }
     for (int c = 0; c < MAX_CLIENTS; c++)
         if (clients[c].fd >= 0) close_control_client(epfd, &clients[c]);
     if (ctrl_fd >= 0) { close(ctrl_fd); if (owns_control_socket) unlink(socket_path); }
